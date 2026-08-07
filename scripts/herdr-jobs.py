@@ -72,17 +72,24 @@ STYLE_NAMES = {"ok", "fail", "warn", "muted", "normal"}
 NOTIFY_LEVELS = {"info", "ok", "warn", "fail"}
 NOTIFY_LEVEL_FOR_STYLE = {"ok": "ok", "fail": "fail", "warn": "warn", "muted": "info", "normal": "info"}
 
-# COMPLETED/FAILED/TIMEOUT/CANCELLED are the four states the spec assigns a
-# style+glyph. Anything else sacct can report (NODE_FAIL, OUT_OF_MEMORY, ...)
-# is not covered by the spec; history mode falls back to a generic marker
-# rather than silently dropping the job (see module-level note in
-# compute_history_payload). Linger intentionally does NOT use that fallback:
-# an unmapped state on a vanished job is dropped rather than guessed at.
+# Every terminal state sacct can report gets an explicit marker. The spec only
+# named four; the rest previously fell back to the state's first two letters,
+# which produced unreadable markers like "OU" for OUT_OF_MEMORY. Codes are up
+# to 3 chars so that, paired with the "how long ago" suffix, they still fit the
+# 7-column third cell (e.g. "OOM 2h").
+#
+# Linger intentionally does NOT use a fallback: an unmapped state on a vanished
+# job is dropped rather than guessed at.
 STATE_STYLE_MAP: dict[str, tuple[str, str]] = {
-    "COMPLETED": ("ok", "✓"),   # check mark
-    "FAILED": ("fail", "✗"),    # ballot x
-    "TIMEOUT": ("warn", "TO"),
-    "CANCELLED": ("muted", "CA"),
+    "COMPLETED": ("ok", "✓"),       # check mark
+    "FAILED": ("fail", "✗"),        # ballot x
+    "TIMEOUT": ("warn", "TO"),      # hit its wall time
+    "CANCELLED": ("muted", "CA"),   # scancel'd, by you or by an admin
+    "OUT_OF_MEMORY": ("fail", "OOM"),
+    "NODE_FAIL": ("fail", "NF"),    # a node died under the job
+    "BOOT_FAIL": ("fail", "BF"),
+    "PREEMPTED": ("warn", "PRE"),   # evicted for a higher-priority job
+    "DEADLINE": ("warn", "DL"),
 }
 
 # Order the collapsed-header summary counts appear in.
@@ -92,6 +99,14 @@ TERMINAL_SACCT_STATES = {
     "COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL",
     "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL", "DEADLINE",
 }
+
+# History mode shows how jobs *finished on their own*, so CANCELLED is excluded:
+# you already know you cancelled it, and a batch of cancellations otherwise
+# floods out the completions and failures you actually want to review. The
+# remaining states are all outcomes the scheduler decided, not the user.
+# (CANCELLED still appears in the live Done group, where "I just killed that"
+# is exactly the feedback you want.)
+HISTORY_SACCT_STATES = TERMINAL_SACCT_STATES - {"CANCELLED"}
 
 # Directory-name components too generic to identify a job on their own; when
 # the last path component is one of these (or purely numeric, e.g. a run
@@ -135,6 +150,46 @@ def nodes_cell(nodes_field: str) -> str:
     if not nodes_field:
         return "?N"
     return clean(f"{nodes_field}N")
+
+
+def sacct_node_count(job: dict[str, Any]) -> str:
+    """Node count for a finished job.
+
+    `allocation_nodes` is 0 for a job cancelled before it was ever allocated
+    (sacct also reports `nodes: "None assigned"` for those). Note 0 is falsy,
+    so `job.get("allocation_nodes") or ""` silently yields "" and the row then
+    renders "?N" -- that was the original bug. Fall through to the *requested*
+    node count from the TRES block, which is populated even for a job that
+    never started, so the row still says how big the job would have been.
+    """
+    allocated = job.get("allocation_nodes")
+    if isinstance(allocated, int) and allocated > 0:
+        return str(allocated)
+    tres = job.get("tres")
+    if isinstance(tres, dict):
+        for key in ("allocated", "requested"):
+            entries = tres.get(key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("type") != "node":
+                    continue
+                count = entry.get("count")
+                if isinstance(count, int) and count > 0:
+                    return str(count)
+    return ""
+
+
+def format_ago(seconds: float) -> str:
+    """Compact "how long ago" for a finished job: 45s / 12m / 3h / 2d."""
+    secs = max(0, int(round(seconds)))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
 
 
 def map_state(raw_state: str) -> tuple[str, str] | None:
@@ -647,7 +702,7 @@ def parse_sacct_history(text: str) -> list[dict[str, Any]]:
                 "id": job_id_str,
                 "state": token,
                 "workdir": job.get("working_directory", "") or "",
-                "nodes": str(job.get("allocation_nodes", "") or ""),
+                "nodes": sacct_node_count(job),
                 "end": end,
             })
         except (TypeError, ValueError, KeyError, AttributeError):
@@ -669,21 +724,29 @@ def fetch_sacct_history() -> list[dict[str, Any]]:
     return parse_sacct_history(proc.stdout)
 
 
-def compute_history_payload(entries: list[dict[str, Any]], limit: int = 10) -> dict[str, Any]:
-    ordered = sorted(entries, key=lambda e: e.get("end", 0) or 0, reverse=True)[:limit]
+def compute_history_payload(
+    entries: list[dict[str, Any]], now: float, limit: int = 10
+) -> dict[str, Any]:
+    finished = [e for e in entries if e.get("state") in HISTORY_SACCT_STATES]
+    ordered = sorted(finished, key=lambda e: e.get("end", 0) or 0, reverse=True)[:limit]
     rows = []
     for entry in ordered:
         mapped = map_state(entry["state"])
         if mapped is None:
-            # State outside the spec's four mapped values (NODE_FAIL, etc.):
+            # A terminal state with no glyph assigned (PREEMPTED, DEADLINE...):
             # show it rather than silently dropping the job from history.
             token = entry["state"]
-            mapped = ("muted", token[:2].upper() if token else "??")
+            mapped = ("warn", token[:2].upper() if token else "??")
         style, glyph = mapped
         dlabel = dir_label(entry.get("workdir", ""))
+        end = entry.get("end", 0) or 0
+        # The third column is 7 wide. A bare glyph wasted six of them, so pair
+        # it with how long ago the job ended -- "when did this finish" is the
+        # question you actually ask of a history list.
+        when = f"{glyph} {format_ago(now - end)}" if end else glyph
         rows.append({
             "id": entry["id"],
-            "cells": [clean(dlabel), nodes_cell(entry.get("nodes", "")), clean(glyph)],
+            "cells": [clean(dlabel), nodes_cell(entry.get("nodes", "")), clean(when)],
             "style": style,
             "vars": {},
             "actions": [],
@@ -692,10 +755,11 @@ def compute_history_payload(entries: list[dict[str, Any]], limit: int = 10) -> d
     if rows:
         groups.append({"id": "history", "label": "History", "rows": rows})
     groups = cap_rows(groups, MAX_ROWS)
+    ok = sum(1 for e in ordered if e.get("state") == "COMPLETED")
     return {
         "version": PROTOCOL_VERSION,
         "title": TITLE,
-        "summary": f"{len(rows)} recent" if rows else "",
+        "summary": f"{ok}/{len(rows)} ok" if rows else "no finished jobs",
         "groups": groups,
         "notify": [],
     }
@@ -1101,12 +1165,12 @@ def run_live(now: float) -> tuple[dict[str, Any], bool]:
     return payload, True
 
 
-def run_history(_now: float) -> tuple[dict[str, Any], bool]:
+def run_history(now: float) -> tuple[dict[str, Any], bool]:
     try:
         entries = fetch_sacct_history()
     except ProviderError as exc:
         return error_payload(str(exc)), False
-    return compute_history_payload(entries), True
+    return compute_history_payload(entries, now), True
 
 
 def emit_payload(payload: dict[str, Any]) -> None:
@@ -1330,16 +1394,28 @@ def run_selftest() -> int:
     _check("linger/aged-out", "done" not in {g["id"] for g in payload4["groups"]}, failures)
 
     # --- unmapped sacct state on a vanish: dropped, not guessed ---
-    def fake_lookup_unmapped(job_id: str) -> tuple[str, str] | None:
+    # NODE_FAIL is now mapped, so a job killed by a dying node surfaces as a red
+    # "NF" Done row instead of silently vanishing from the sidebar.
+    def fake_lookup_node_fail(job_id: str) -> tuple[str, str] | None:
         return ("NODE_FAIL", "1:0")
 
-    payload5, _state5 = compute_live_payload(remaining_rows, state1, now=1005.0, lookup=fake_lookup_unmapped)
-    _check("linger/unmapped-state-dropped", "done" not in {g["id"] for g in payload5["groups"]}, failures)
+    payload5, _state5 = compute_live_payload(remaining_rows, state1, now=1005.0, lookup=fake_lookup_node_fail)
+    done5 = next((g for g in payload5["groups"] if g["id"] == "done"), None)
+    _check("linger/node-fail-shown", done5 is not None, failures)
+    _check("linger/node-fail-style", bool(done5) and done5["rows"][0]["style"] == "fail", failures)
+
+    # A state with no mapping at all is still dropped rather than guessed at.
+    def fake_lookup_unmapped(job_id: str) -> tuple[str, str] | None:
+        return ("REVOKED", "1:0")
+
+    payload5b, _state5b = compute_live_payload(remaining_rows, state1, now=1005.0, lookup=fake_lookup_unmapped)
+    _check("linger/unmapped-state-dropped", "done" not in {g["id"] for g in payload5b["groups"]}, failures)
 
     # --- map_state ---
     _check("map_state/completed", map_state("COMPLETED") == ("ok", "✓"), failures)
     _check("map_state/cancelled-by", map_state("CANCELLED by 12345") == ("muted", "CA"), failures)
-    _check("map_state/unknown", map_state("BOOT_FAIL") is None, failures)
+    _check("map_state/oom", map_state("OUT_OF_MEMORY") == ("fail", "OOM"), failures)
+    _check("map_state/unknown", map_state("REVOKED") is None, failures)
     _check("map_state/empty", map_state("") is None, failures)
 
     # --- history (JSON) ---
@@ -1348,15 +1424,39 @@ def run_selftest() -> int:
     _check("history/non-terminal-dropped", all(e["id"] != "55240005" for e in hist_entries), failures)
     _check("history/count", len(hist_entries) == 4, failures)
     _check("history/bad-json-raises", _raises(ProviderError, parse_sacct_history, "not json"), failures)
-    hist_payload = compute_history_payload(hist_entries, limit=10)
+    hist_payload = compute_history_payload(hist_entries, now=5000.0, limit=10)
     hist_rows = hist_payload["groups"][0]["rows"] if hist_payload["groups"] else []
-    _check("history/row-count", len(hist_rows) == 4, failures)
-    _check("history/sorted-desc", hist_rows[0]["id"] == "55240003", failures)  # latest End
-    fallback_row = next(r for r in hist_rows if r["id"] == "55240006")
-    _check("history/fallback-style", fallback_row["style"] == "muted", failures)
-    _check("history/fallback-glyph", fallback_row["cells"][2] == "OU", failures)
-    hist_payload_limited = compute_history_payload(hist_entries, limit=1)
+    # CANCELLED (55240003) is the most recent entry but must be excluded: history
+    # shows how jobs finished on their own, not ones the user killed.
+    _check("history/cancelled-excluded", all(r["id"] != "55240003" for r in hist_rows), failures)
+    _check("history/row-count", len(hist_rows) == 3, failures)
+    _check("history/sorted-desc", hist_rows[0]["id"] == "55240001", failures)  # latest non-cancelled
+    oom_row = next(r for r in hist_rows if r["id"] == "55240006")
+    _check("history/oom-style", oom_row["style"] == "fail", failures)
+    _check("history/oom-marker", oom_row["cells"][2].startswith("OOM"), failures)
+    # end=3000 against now=5000 is 2000s -> "33m"; the marker carries the age.
+    _check("history/ago-suffix", hist_rows[0]["cells"][2] == "✓ 33m", failures)
+    # allocation_nodes=1 must render "1N", not "?N" (0 is falsy, 1 is not, but
+    # the regression guard belongs here next to the fixture).
+    _check("history/nodes-rendered", all("?" not in r["cells"][1] for r in hist_rows), failures)
+    _check("history/summary", hist_payload["summary"] == "1/3 ok", failures)
+    hist_payload_limited = compute_history_payload(hist_entries, now=5000.0, limit=1)
     _check("history/limit", len(hist_payload_limited["groups"][0]["rows"]) == 1, failures)
+
+    # Node count for a job cancelled before allocation: allocation_nodes is 0
+    # (falsy!) and sacct says "None assigned", but TRES still carries the
+    # requested count. This is the "?N" bug.
+    _check("nodes/zero-alloc-falls-back-to-tres", sacct_node_count({
+        "allocation_nodes": 0, "nodes": "None assigned",
+        "tres": {"allocated": [], "requested": [{"type": "node", "count": 84}]},
+    }) == "84", failures)
+    _check("nodes/allocated-preferred", sacct_node_count({
+        "allocation_nodes": 4,
+        "tres": {"requested": [{"type": "node", "count": 84}]},
+    }) == "4", failures)
+    _check("nodes/no-info-is-empty", sacct_node_count({"allocation_nodes": 0}) == "", failures)
+    _check("ago/units", (format_ago(45), format_ago(700), format_ago(7000), format_ago(200000))
+           == ("45s", "11m", "1h", "2d"), failures)
 
     # --- state file round trip + graceful corruption handling ---
     tmp_state_dir = tempfile.mkdtemp(prefix="herdr-jobs-selftest-")
