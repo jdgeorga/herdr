@@ -56,6 +56,15 @@ TITLE = "JOBS"
 MAX_ROWS = 2000
 DONE_TTL_SECONDS = 600
 
+# A running job whose stdout has not grown in this long is very likely wedged --
+# a deadlocked MPI collective, a blocked filesystem call, a solver that stopped
+# converging and stopped printing. It is still RUNNING as far as Slurm knows, so
+# nothing else in the queue view would tell you. Marked by styling the row
+# "warn": on a Running row that can only mean stalled, and unlike a glyph it
+# costs no columns (U+26A0 is East-Asian Ambiguous width and would misalign the
+# fixed-width cells on some terminals).
+STALL_SECONDS = 900
+
 # Consumer-side hard caps (see spec "Provider protocol" section): 2000 rows,
 # 1 KiB per string, 256 KiB total. Exceeding any of these fails the WHOLE
 # payload. We enforce our own versions of these caps before emitting so a
@@ -292,6 +301,18 @@ def _time_left_str(job: dict[str, Any], now: float) -> str:
     return format_duration(end_value - now)
 
 
+def _start_epoch(job: dict[str, Any]) -> float:
+    """Raw start time as an epoch float, or 0.0 when unset/unusable.
+
+    Separate from _start_str because the header aggregate needs arithmetic,
+    not a display string.
+    """
+    value, infinite = _slurm_number(job.get("start_time", {}))
+    if infinite or value is None or value <= 0 or not math.isfinite(float(value)):
+        return 0.0
+    return float(value)
+
+
 def _start_str(job: dict[str, Any]) -> str:
     value, infinite = _slurm_number(job.get("start_time", {}))
     if infinite:
@@ -426,6 +447,7 @@ def parse_squeue_json(text: str, now: float) -> list[dict[str, Any]]:
                 "timeleft": _time_left_str(job, now),
                 "timelimit": _time_limit_str(job),
                 "start": _start_str(job),
+                "start_epoch": _start_epoch(job),
                 "reason": clean(job.get("state_reason", "")),
                 "workdir": workdir,
                 "stdout": stdout_path,
@@ -483,7 +505,13 @@ def sacct_lookup(job_id: str) -> tuple[str, str] | None:
     return None
 
 
-def build_active_row(row: dict[str, Any], dlabel: str, ncell: str, running: bool) -> dict[str, Any]:
+def build_active_row(
+    row: dict[str, Any],
+    dlabel: str,
+    ncell: str,
+    running: bool,
+    stalled: bool = False,
+) -> dict[str, Any]:
     time_cell = clean(row["timeleft"] if running else row["timelimit"])
     row_vars: dict[str, str] = {"dir": row["workdir"]}
     actions: list[str] = []
@@ -500,10 +528,54 @@ def build_active_row(row: dict[str, Any], dlabel: str, ncell: str, running: bool
     return {
         "id": row["id"],
         "cells": [clean(dlabel), ncell, time_cell],
-        "style": "normal",
+        "style": "warn" if (running and stalled) else "normal",
         "vars": row_vars,
         "actions": actions,
     }
+
+
+def log_size(path: str) -> int | None:
+    """Size of a job's stdout, or None when it cannot be read.
+
+    One stat per running job per poll. None (missing file, permission error,
+    unmounted filesystem) means "no opinion" -- never treat it as a stall,
+    since an unreadable log says nothing about whether the job is progressing.
+    """
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
+def track_log_growth(
+    job_id: str,
+    path: str,
+    prior_info: dict[str, Any],
+    now: float,
+    stat_log: Callable[[str], int | None],
+) -> tuple[dict[str, Any], bool]:
+    """Update a job's log-growth tracking and decide whether it looks stalled.
+
+    Returns (fields to merge into this job's seen_ids entry, stalled).
+    A job is never reported stalled on the poll where we first see it -- there
+    is no baseline yet, so `grew_at` starts at now and the clock runs from there.
+    """
+    size = stat_log(path)
+    if size is None:
+        return {}, False
+    prior_size = prior_info.get("log_size")
+    prior_grew = prior_info.get("log_grew_at")
+    grew_at: float
+    if not isinstance(prior_size, int) or not isinstance(prior_grew, (int, float)) \
+            or not math.isfinite(float(prior_grew)):
+        grew_at = now              # first sighting: start the clock, do not accuse
+    elif size != prior_size:
+        grew_at = now              # output moved (shrink counts too: log rotated)
+    else:
+        grew_at = float(prior_grew)
+    return {"log_size": size, "log_grew_at": grew_at}, (now - grew_at) >= STALL_SECONDS
 
 
 def job_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, str]:
@@ -512,7 +584,27 @@ def job_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, str]:
     return (int(match.group(1)) if match else (1 << 62), job_id)
 
 
-def build_summary(running_count: int, queued_count: int, done_map: dict[str, dict[str, Any]]) -> str:
+def format_node_hours(node_seconds: float) -> str:
+    """Node-hours, compact enough for the header: 40nh, 1.2knh."""
+    hours = node_seconds / 3600.0
+    if hours >= 1000:
+        return f"{hours / 1000:.1f}knh"
+    if hours >= 10:
+        return f"{int(round(hours))}nh"
+    return f"{hours:.1f}nh"
+
+
+def build_summary(
+    running_count: int,
+    queued_count: int,
+    done_map: dict[str, dict[str, Any]],
+    nodes_held: int = 0,
+    node_seconds: float = 0.0,
+    stalled_count: int = 0,
+) -> str:
+    """The collapsed-header line. Budget is ~24 columns, so the aggregate is
+    appended only when it has something to say, and the stall count -- the one
+    piece that wants acting on -- goes first among the extras."""
     parts = []
     if running_count:
         parts.append(f"{running_count}R")
@@ -526,7 +618,17 @@ def build_summary(running_count: int, queued_count: int, done_map: dict[str, dic
         n = style_counts.get(style, 0)
         if n:
             parts.append(f"{n}{glyph}")
-    return "  ".join(parts)
+    head = "  ".join(parts)
+    extras = []
+    if stalled_count:
+        extras.append(f"{stalled_count} stalled")
+    if nodes_held:
+        extras.append(f"{nodes_held}N")
+    if node_seconds > 0:
+        extras.append(format_node_hours(node_seconds))
+    if not extras:
+        return head
+    return f"{head} · {' '.join(extras)}" if head else " ".join(extras)
 
 
 def compute_live_payload(
@@ -534,11 +636,13 @@ def compute_live_payload(
     prior_state: dict[str, Any],
     now: float,
     lookup: Callable[[str], tuple[str, str] | None],
+    stat_log: Callable[[str], int | None] = log_size,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Pure(-ish) core of live mode: squeue rows + prior state -> payload + new state.
 
-    `lookup` is injected so tests can exercise the linger transition without
-    calling sacct. `prior_state` is expected to already be validated (see
+    `lookup` and `stat_log` are injected so tests can exercise the linger
+    transition and stall detection without calling sacct or touching the
+    filesystem. `prior_state` is expected to already be validated (see
     validate_state / MEDIUM 6); the checks below are defense in depth, not
     the primary sanitizer.
     """
@@ -548,9 +652,12 @@ def compute_live_payload(
     prior_done = prior_state.get("done")
     prior_done = prior_done if isinstance(prior_done, dict) else {}
 
-    current: dict[str, dict[str, str]] = {}
+    current: dict[str, dict[str, Any]] = {}
     running_rows: list[tuple[str, dict[str, Any]]] = []
     queued_rows: list[tuple[str, dict[str, Any]]] = []
+    stalled_count = 0
+    nodes_held = 0
+    node_seconds = 0.0
 
     for row in rows:
         job_id = row.get("id", "")
@@ -561,7 +668,34 @@ def compute_live_payload(
         current[job_id] = {"dir_label": dlabel, "nodes": ncell}
         state = row.get("state", "")
         if state == "R":
-            running_rows.append((job_id, build_active_row(row, dlabel, ncell, running=True)))
+            prior_info = prior_seen.get(job_id)
+            prior_info = prior_info if isinstance(prior_info, dict) else {}
+            stdout_path = row.get("stdout", "")
+            tracked: dict[str, Any] = {}
+            stalled = False
+            if stdout_path and "%" not in stdout_path and stdout_path.startswith("/"):
+                tracked, stalled = track_log_growth(
+                    job_id, stdout_path, prior_info, now, stat_log
+                )
+            current[job_id].update(tracked)
+            if stalled:
+                stalled_count += 1
+            running_rows.append(
+                (job_id, build_active_row(row, dlabel, ncell, running=True, stalled=stalled))
+            )
+            # Header aggregate: nodes currently held, and the node-hours those
+            # running jobs have burned so far. Both come from squeue alone --
+            # a "today" figure would need sacct, which is deliberately kept off
+            # the steady poll.
+            try:
+                node_n = int(row.get("nodes") or 0)
+            except (TypeError, ValueError):
+                node_n = 0
+            if node_n > 0:
+                nodes_held += node_n
+                started = row.get("start_epoch") or 0.0
+                if started and now > started:
+                    node_seconds += node_n * (now - started)
         elif state == "PD":
             queued_rows.append((job_id, build_active_row(row, dlabel, ncell, running=False)))
         # Other squeue states (e.g. CG completing) are kept in `current` so a
@@ -645,7 +779,10 @@ def compute_live_payload(
         groups.append({"id": "done", "label": "Done", "rows": done_rows})
 
     groups = cap_rows(groups, MAX_ROWS)
-    summary = build_summary(len(running_rows), len(queued_rows), done_map)
+    summary = build_summary(
+        len(running_rows), len(queued_rows), done_map,
+        nodes_held=nodes_held, node_seconds=node_seconds, stalled_count=stalled_count,
+    )
 
     payload = {
         "version": PROTOCOL_VERSION,
@@ -1342,8 +1479,58 @@ def run_selftest() -> int:
     queued_row = groups_by_id["queued"]["rows"][0]
     _check("live/queued-cells-time", queued_row["cells"][2] == "1-00:00:00", failures)
     _check("live/queued-no-tail", queued_row["actions"] == ["cancel"], failures)
-    _check("live/summary", payload["summary"] == "2R  1Q", failures)
+    # Header aggregate: the two running fixture jobs hold 4 + 8 nodes. No
+    # node-hours figure appears because FIXTURE_NOW is 1000.0 and the fixture
+    # start times are FIXTURE_NOW - 5000, i.e. negative epochs, which
+    # _start_epoch rejects -- so this doubles as a guard that a nonsensical
+    # start time contributes nothing rather than a wild number.
+    _check("live/summary", payload["summary"] == "2R  1Q · 12N", failures)
+    _check("live/summary-node-hours", build_summary(
+        1, 0, {}, nodes_held=4, node_seconds=4 * 3600 * 10) == "1R · 4N 40nh", failures)
+    _check("live/summary-bare", build_summary(1, 0, {}) == "1R", failures)
     _check("live/state-seen-ids", set(state1["seen_ids"]) == {"55241874", "55241900", "55241950"}, failures)
+    _check("nodehours/format", (format_node_hours(3600 * 4.2), format_node_hours(3600 * 40),
+                                format_node_hours(3600 * 1500))
+           == ("4.2nh", "40nh", "1.5knh"), failures)
+
+    # --- stall detection ---
+    # A job is never accused on first sighting: there is no baseline, so the
+    # clock starts now.
+    first, stalled_first = track_log_growth("1", "/x", {}, now=1000.0, stat_log=lambda p: 500)
+    _check("stall/first-sighting-not-stalled", not stalled_first, failures)
+    _check("stall/first-sighting-baseline", first == {"log_size": 500, "log_grew_at": 1000.0}, failures)
+    # Log grew: the clock resets even if it had been idle a long time.
+    grew, stalled_grew = track_log_growth(
+        "1", "/x", {"log_size": 500, "log_grew_at": 0.0}, now=1000.0, stat_log=lambda p: 900)
+    _check("stall/growth-resets", grew["log_grew_at"] == 1000.0 and not stalled_grew, failures)
+    # Size unchanged and past the threshold: stalled.
+    _, stalled_idle = track_log_growth(
+        "1", "/x", {"log_size": 500, "log_grew_at": 0.0},
+        now=float(STALL_SECONDS) + 1, stat_log=lambda p: 500)
+    _check("stall/idle-past-threshold", stalled_idle, failures)
+    # Unchanged but still inside the window: not yet.
+    _, stalled_recent = track_log_growth(
+        "1", "/x", {"log_size": 500, "log_grew_at": 0.0},
+        now=float(STALL_SECONDS) - 1, stat_log=lambda p: 500)
+    _check("stall/idle-within-window", not stalled_recent, failures)
+    # An unreadable log is NOT evidence of a stall.
+    unreadable, stalled_unreadable = track_log_growth(
+        "1", "/x", {"log_size": 500, "log_grew_at": 0.0},
+        now=1e9, stat_log=lambda p: None)
+    _check("stall/unreadable-log-no-opinion", unreadable == {} and not stalled_unreadable, failures)
+    # A shrinking log (rotated/truncated) counts as movement, not a stall.
+    _, stalled_shrunk = track_log_growth(
+        "1", "/x", {"log_size": 500, "log_grew_at": 0.0}, now=1e9, stat_log=lambda p: 10)
+    _check("stall/shrink-counts-as-growth", not stalled_shrunk, failures)
+    # End to end: a stalled running row is styled warn and counted in the header.
+    stall_state = {"seen_ids": {"55241874": {"log_size": 42, "log_grew_at": 0.0}}, "done": {}}
+    stall_payload, _ = compute_live_payload(
+        rows, stall_state, now=float(STALL_SECONDS) + 10,
+        lookup=lambda j: None, stat_log=lambda p: 42)
+    stall_running = next(g for g in stall_payload["groups"] if g["id"] == "running")
+    stalled_row = next(r for r in stall_running["rows"] if r["id"] == "55241874")
+    _check("stall/row-styled-warn", stalled_row["style"] == "warn", failures)
+    _check("stall/counted-in-summary", "1 stalled" in stall_payload["summary"], failures)
 
     # --- linger: job 55241874 vanishes, sacct reports COMPLETED ---
     def fake_lookup_completed(job_id: str) -> tuple[str, str] | None:
