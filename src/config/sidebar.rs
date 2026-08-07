@@ -654,6 +654,26 @@ impl ListSectionConfig {
 
         diagnostics
     }
+
+    /// `self` unchanged if it passes its own [`Self::diagnostics`] checks,
+    /// otherwise a disabled fallback (design doc finding: "invalid
+    /// cadence/timeout is diagnosed but still applied" -- e.g.
+    /// `refresh_seconds = 1` with `timeout_seconds = 60` was reported as a
+    /// diagnostic at startup and then run anyway). Every polling code path
+    /// (`list_refresh.rs`) already gates on `enabled`, so disabling here is
+    /// sufficient to keep a misconfigured refresh/timeout pair -- or any
+    /// other `diagnostics()` violation -- from ever actually running,
+    /// without silently rewriting values the user wrote.
+    pub fn sanitized(&self) -> Self {
+        if self.diagnostics().is_empty() {
+            self.clone()
+        } else {
+            Self {
+                enabled: false,
+                ..self.clone()
+            }
+        }
+    }
 }
 
 impl Default for ListSectionConfig {
@@ -667,6 +687,14 @@ impl Default for ListSectionConfig {
             max_visible_rows: 12,
             command: vec![
                 "/usr/bin/python3.11".to_string(),
+                // Design doc: "The flags are not optional. Python startup
+                // runs sitecustomize and user-site code before main(), and
+                // anything that prints there lands on stdout ahead of the
+                // JSON... -I (isolated) and -S (no site) close that. Because
+                // herdr executes `python3.11 <script>` rather than exec'ing
+                // the file, the shebang alone is not enough."
+                "-I".to_string(),
+                "-S".to_string(),
                 expand_tilde_token("~/.config/herdr/scripts/herdr-jobs.py"),
                 "--mode".to_string(),
                 "{mode}".to_string(),
@@ -978,6 +1006,8 @@ rows = [[{ token = "git_status", fg = "#ff00aa" }], [{ token = "$jj", bold = tru
             list.command,
             vec![
                 "/usr/bin/python3.11".to_string(),
+                "-I".to_string(),
+                "-S".to_string(),
                 expand_tilde_token("~/.config/herdr/scripts/herdr-jobs.py"),
                 "--mode".to_string(),
                 "{mode}".to_string(),
@@ -1031,7 +1061,7 @@ collapsed = true
 refresh_seconds = 10
 timeout_seconds = 5
 max_visible_rows = 12
-command = ["/usr/bin/python3.11", "/opt/herdr-jobs.py", "--mode", "{mode}"]
+command = ["/usr/bin/python3.11", "-I", "-S", "/opt/herdr-jobs.py", "--mode", "{mode}"]
 modes = ["live", "history"]
 
 columns = [
@@ -1215,6 +1245,34 @@ cwd = "~/logs"
             .diagnostics()
             .iter()
             .any(|diag| diag.contains("must be less than refresh_seconds")));
+    }
+
+    /// Finding 8: an invalid subsection must not run just because it was
+    /// diagnosed. `sanitized()` is the startup-time counterpart of live
+    /// reload's "keep the previous config" behavior -- there's no previous
+    /// config to fall back to on first load, so it disables the section
+    /// instead of applying a broken cadence/timeout pair.
+    #[test]
+    fn sanitized_disables_a_list_section_that_fails_its_own_diagnostics() {
+        let list = ListSectionConfig {
+            refresh_seconds: 1,
+            timeout_seconds: 60,
+            ..ListSectionConfig::default()
+        };
+        assert!(!list.diagnostics().is_empty());
+
+        let sanitized = list.sanitized();
+        assert!(!sanitized.enabled);
+        // Everything else survives untouched -- only `enabled` changes.
+        assert_eq!(sanitized.refresh_seconds, 1);
+        assert_eq!(sanitized.timeout_seconds, 60);
+    }
+
+    #[test]
+    fn sanitized_is_a_no_op_for_a_valid_list_section() {
+        let list = ListSectionConfig::default();
+        assert!(list.diagnostics().is_empty());
+        assert_eq!(list.sanitized(), list);
     }
 
     #[test]

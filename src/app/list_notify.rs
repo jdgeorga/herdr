@@ -8,6 +8,8 @@
 //! `notify[].id` so a provider that keeps reporting the same event doesn't
 //! re-toast it.
 
+use std::collections::{HashSet, VecDeque};
+
 use super::App;
 use crate::app::state::{ToastKind, ToastNotification};
 use crate::list_section::protocol::{NotifyLevel, ParsedNotify};
@@ -15,6 +17,73 @@ use crate::list_section::protocol::{NotifyLevel, ParsedNotify};
 /// Cap on queued-but-not-yet-shown notifications (design doc: "a bounded
 /// FIFO, cap 8, oldest dropped").
 const MAX_QUEUED_LIST_NOTIFICATIONS: usize = 8;
+
+/// Cap on remembered `notify[].id`s (finding: an unbounded `HashSet` here
+/// retains one string per id forever -- at a ~10s cadence that's roughly
+/// 8,640 polls/day, and any provider that ever mints a fresh id per poll
+/// (even just for its own steady-state jobs, not only completions) grows
+/// this without bound for the life of the process). 512 comfortably covers
+/// the realistic case (the protocol caps a single poll at 2000 rows, and a
+/// provider's own 10-minute linger window means any one id is at most
+/// repeated across ~60 polls at the default 10s cadence) while bounding
+/// memory for a session that runs for days.
+const MAX_REMEMBERED_LIST_NOTIFY_IDS: usize = 512;
+
+/// Insertion-ordered, capacity-bounded id set (design doc finding: "a
+/// bounded LRU or prune once an id is no longer present for longer than the
+/// provider's linger window"). Evicts the oldest-inserted id once `cap` is
+/// exceeded, which is safe here specifically because the property this set
+/// protects -- "don't re-toast an id the provider keeps repeating" -- only
+/// needs to hold across a provider's own linger window, and eviction only
+/// discards ids old enough that hundreds of newer ones have been seen since.
+#[derive(Debug, Clone)]
+pub struct BoundedIdSet {
+    order: VecDeque<String>,
+    members: HashSet<String>,
+    cap: usize,
+}
+
+impl BoundedIdSet {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            members: HashSet::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Inserts `id`, evicting the oldest entry first if already at capacity.
+    /// Returns `true` if `id` was newly inserted (i.e. not already present).
+    pub fn insert(&mut self, id: String) -> bool {
+        if self.members.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.members.remove(&oldest);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.members.insert(id);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, id: &str) -> bool {
+        self.members.contains(id)
+    }
+}
+
+impl Default for BoundedIdSet {
+    fn default() -> Self {
+        Self::new(MAX_REMEMBERED_LIST_NOTIFY_IDS)
+    }
+}
 
 impl App {
     /// Queues newly-seen `notify` entries from a completed poll, then
@@ -140,6 +209,52 @@ mod tests {
         app.enqueue_list_notifications(&[notify("done-1", NotifyLevel::Ok, "first again")]);
         assert!(app.state.toast.is_none());
         assert!(app.state.list_notify_queue.is_empty());
+    }
+
+    // -- BoundedIdSet ------------------------------------------------------
+
+    #[test]
+    fn bounded_id_set_reports_new_vs_already_seen() {
+        let mut set = BoundedIdSet::new(4);
+        assert!(set.insert("a".to_string()));
+        assert!(!set.insert("a".to_string()));
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("a"));
+    }
+
+    #[test]
+    fn bounded_id_set_evicts_oldest_once_at_capacity() {
+        let mut set = BoundedIdSet::new(3);
+        for id in ["a", "b", "c"] {
+            assert!(set.insert(id.to_string()));
+        }
+        assert_eq!(set.len(), 3);
+
+        // Over capacity: "a" (oldest) is evicted to make room for "d".
+        assert!(set.insert("d".to_string()));
+        assert_eq!(set.len(), 3);
+        assert!(!set.contains("a"));
+        assert!(set.contains("b"));
+        assert!(set.contains("c"));
+        assert!(set.contains("d"));
+
+        // Evicted ids are treated as new again -- a provider id that ages
+        // out and is (implausibly) reused would toast once more, which is
+        // an acceptable cosmetic cost for bounding memory.
+        assert!(set.insert("a".to_string()));
+    }
+
+    #[test]
+    fn list_notify_seen_stays_bounded_across_many_distinct_ids() {
+        let mut app = test_app();
+        let entries: Vec<ParsedNotify> = (0..MAX_REMEMBERED_LIST_NOTIFY_IDS + 200)
+            .map(|i| notify(&format!("done-{i}"), NotifyLevel::Ok, "x"))
+            .collect();
+        app.enqueue_list_notifications(&entries);
+        assert_eq!(
+            app.state.list_notify_seen.len(),
+            MAX_REMEMBERED_LIST_NOTIFY_IDS
+        );
     }
 
     #[test]

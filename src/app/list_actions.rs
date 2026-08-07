@@ -54,9 +54,34 @@ impl App {
             self.refuse_list_action("action is not configured");
             return;
         };
+        // Design doc: "Each provider row carries an `actions: [...]` list.
+        // That list is AUTHORIZATION" -- a Done/history row reports
+        // `actions: []` precisely so it cannot be acted on. This is the
+        // authoritative check: it re-reads the row's *current* `actions`
+        // (not whatever the context menu was built from), so a row that
+        // changed between menu-open and menu-selection cannot slip an
+        // unauthorized action through.
+        if !row.actions.iter().any(|permitted| permitted == action_id) {
+            self.refuse_list_action("action is not permitted for this job");
+            return;
+        }
 
-        let row_ctx = row_context(row);
+        let mut row_ctx = row_context(row);
         let mode = self.state.jobs.mode.clone();
+
+        // Design doc's Security section: "{log} and {dir} must be absolute,
+        // canonicalized, and existing" -- checked unconditionally, not just
+        // for actions that reference them, since "tail will happily display
+        // any file the user can read". Canonicalizing *before* substitution
+        // and freezing the canonical value into `row_ctx` (rather than
+        // validating and then discarding the result) closes a TOCTOU gap:
+        // if the caller instead re-substituted the row's original,
+        // uncanonicalized value into argv/cwd, retargeting the symlink
+        // between validation and execution would change what actually runs.
+        if let Err(err) = canonicalize_list_row_paths(&mut row_ctx) {
+            self.refuse_list_action(&err.to_string());
+            return;
+        }
 
         let argv = match resolve_argv(&config.command, &row_ctx, &mode) {
             Ok(argv) => argv,
@@ -66,14 +91,6 @@ impl App {
             }
         };
         if let Err(err) = validate_list_action_fields(&config, &row_ctx, &mode) {
-            self.refuse_list_action(&err.to_string());
-            return;
-        }
-        // Design doc's Security section: "{log} and {dir} must be absolute,
-        // canonicalized, and existing" -- checked unconditionally, not just
-        // for actions that reference them, since "tail will happily display
-        // any file the user can read".
-        if let Err(err) = validate_list_row_paths(&row_ctx) {
             self.refuse_list_action(&err.to_string());
             return;
         }
@@ -325,11 +342,19 @@ fn validate_list_action_fields(
 }
 
 /// Design doc's Security section: "{log} and {dir} must be absolute,
-/// canonicalized, and existing."
-fn validate_list_row_paths(row: &RowContext) -> Result<(), SubstError> {
+/// canonicalized, and existing." Rewrites `row.vars["log"]`/`["dir"]` in
+/// place to `validate_path`'s canonicalized result -- not just checking it
+/// and discarding it -- so every downstream substitution (argv, cwd,
+/// confirm prompt) resolves against the canonical path rather than the
+/// provider's original, potentially-symlinked one (finding: "canonicalized
+/// paths are validated then discarded... the caller drops it and freezes
+/// the ORIGINAL symlink path into argv/cwd").
+fn canonicalize_list_row_paths(row: &mut RowContext) -> Result<(), SubstError> {
     for name in ["log", "dir"] {
         if let Some(value) = row.vars.get(name) {
-            validate_path(value)?;
+            let canonical = validate_path(value)?;
+            row.vars
+                .insert(name.to_string(), canonical.to_string_lossy().into_owned());
         }
     }
     Ok(())
@@ -375,6 +400,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn row(id: &str, cells: &[&str], vars: &[(&str, &str)]) -> ParsedRow {
+        row_with_actions(id, cells, vars, &[])
+    }
+
+    fn row_with_actions(
+        id: &str,
+        cells: &[&str],
+        vars: &[(&str, &str)],
+        actions: &[&str],
+    ) -> ParsedRow {
         ParsedRow {
             id: id.to_string(),
             cells: cells.iter().map(|c| c.to_string()).collect(),
@@ -383,7 +417,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
-            actions: vec![],
+            actions: actions.iter().map(|a| a.to_string()).collect(),
         }
     }
 
@@ -468,8 +502,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_list_row_paths_rejects_relative_log() {
-        let ctx = RowContext {
+    fn canonicalize_list_row_paths_rejects_relative_log() {
+        let mut ctx = RowContext {
             id: "1".to_string(),
             cells: vec![],
             vars: [("log".to_string(), "slurm-1.out".to_string())]
@@ -477,19 +511,59 @@ mod tests {
                 .collect(),
         };
         assert!(matches!(
-            validate_list_row_paths(&ctx),
+            canonicalize_list_row_paths(&mut ctx),
             Err(SubstError::PathNotAbsolute { .. })
         ));
     }
 
     #[test]
-    fn validate_list_row_paths_accepts_absent_vars() {
-        let ctx = RowContext {
+    fn canonicalize_list_row_paths_accepts_absent_vars() {
+        let mut ctx = RowContext {
             id: "1".to_string(),
             cells: vec![],
             vars: Default::default(),
         };
-        assert!(validate_list_row_paths(&ctx).is_ok());
+        assert!(canonicalize_list_row_paths(&mut ctx).is_ok());
+    }
+
+    /// Finding 7: the canonicalized value must actually replace the
+    /// original in `row.vars`, not just be checked and discarded -- a
+    /// symlink retargeted between validation and execution must not change
+    /// what runs, since everything downstream (argv, cwd, confirm prompt)
+    /// substitutes from `row.vars` after this call.
+    #[test]
+    fn canonicalize_list_row_paths_rewrites_the_var_to_the_canonical_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-list-actions-canon-test-{}-{}",
+            std::process::id(),
+            "rewrite"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let real_file = dir.join("real.out");
+        std::fs::write(&real_file, b"x").expect("write real file");
+
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.out");
+            std::os::unix::fs::symlink(&real_file, &link).expect("create symlink");
+            let mut ctx = RowContext {
+                id: "1".to_string(),
+                cells: vec![],
+                vars: [("log".to_string(), link.to_string_lossy().into_owned())]
+                    .into_iter()
+                    .collect(),
+            };
+            canonicalize_list_row_paths(&mut ctx).expect("symlink to an existing file resolves");
+            let canonical_real = std::fs::canonicalize(&real_file).expect("canonicalize real file");
+            assert_eq!(
+                ctx.vars["log"],
+                canonical_real.to_string_lossy().into_owned(),
+                "row.vars must hold the canonical target, not the original symlink path"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -556,7 +630,10 @@ mod tests {
 
     #[test]
     fn choose_list_action_opens_confirm_dialog_with_frozen_argv() {
-        let mut app = test_app_with_job(cancel_action_config(), row("55241874", &["ued"], &[]));
+        let mut app = test_app_with_job(
+            cancel_action_config(),
+            row_with_actions("55241874", &["ued"], &[], &["cancel"]),
+        );
 
         app.choose_list_action("55241874", "cancel");
 
@@ -602,13 +679,74 @@ mod tests {
 
     #[test]
     fn choose_list_action_refuses_an_adversarial_job_id_without_executing() {
-        let mut app = test_app_with_job(cancel_action_config(), row("-A", &[], &[]));
+        let mut app = test_app_with_job(
+            cancel_action_config(),
+            row_with_actions("-A", &[], &[], &["cancel"]),
+        );
 
         app.choose_list_action("-A", "cancel");
 
         assert!(app.state.list_action_confirm.is_none());
         assert_ne!(app.state.mode, Mode::ContextMenu);
         assert!(app.state.toast.is_some());
+    }
+
+    /// End-to-end version of `canonicalize_list_row_paths_rewrites_the_var_to_the_canonical_path`:
+    /// the argv `choose_list_action` freezes must contain the canonical
+    /// path, not the symlink the provider reported.
+    #[cfg(unix)]
+    #[test]
+    fn choose_list_action_freezes_the_canonical_path_not_the_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-list-actions-canon-test-{}-{}",
+            std::process::id(),
+            "e2e"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let real_file = dir.join("real.out");
+        std::fs::write(&real_file, b"x").expect("write real file");
+        let link = dir.join("link.out");
+        std::os::unix::fs::symlink(&real_file, &link).expect("create symlink");
+        let canonical_real = std::fs::canonicalize(&real_file).expect("canonicalize real file");
+
+        let action = ListActionConfig {
+            id: "tail".to_string(),
+            label: "Tail log".to_string(),
+            command: vec![
+                "tail".to_string(),
+                "-f".to_string(),
+                "--".to_string(),
+                "{log}".to_string(),
+            ],
+            confirm: Some("Tail {log}?".to_string()),
+            target: ActionTarget::Overlay,
+            ..ListActionConfig::default()
+        };
+        let mut app = test_app_with_job(
+            action,
+            row_with_actions("1", &[], &[("log", link.to_str().unwrap())], &["tail"]),
+        );
+
+        app.choose_list_action("1", "tail");
+
+        let confirm = app
+            .state
+            .list_action_confirm
+            .as_ref()
+            .expect("confirm dialog opened");
+        assert_eq!(
+            confirm.argv,
+            vec![
+                "tail".to_string(),
+                "-f".to_string(),
+                "--".to_string(),
+                canonical_real.to_string_lossy().into_owned(),
+            ],
+            "argv must be frozen from the canonical path, not the original symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -625,12 +763,63 @@ mod tests {
             target: ActionTarget::Overlay,
             ..ListActionConfig::default()
         };
-        let mut app =
-            test_app_with_job(action, row("1", &[], &[("log", "relative/slurm-1.out")]));
+        let mut app = test_app_with_job(
+            action,
+            row_with_actions("1", &[], &[("log", "relative/slurm-1.out")], &["tail"]),
+        );
 
         app.choose_list_action("1", "tail");
 
         assert_ne!(app.state.mode, Mode::ContextMenu);
         assert!(app.state.toast.is_some());
+    }
+
+    /// Finding 1: a Done/history row reports `actions: []` precisely so it
+    /// cannot be cancelled. `choose_list_action` must refuse even though
+    /// `cancel` is fully configured -- authorization comes from the row, not
+    /// just the config.
+    #[test]
+    fn choose_list_action_refuses_a_row_with_no_authorized_actions() {
+        let mut app = test_app_with_job(cancel_action_config(), row("55241874", &["ued"], &[]));
+
+        app.choose_list_action("55241874", "cancel");
+
+        assert!(app.state.list_action_confirm.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("action is not permitted for this job")
+        );
+    }
+
+    /// A row that authorizes `cancel` but not `tail` must still refuse
+    /// `tail`, even though `tail` is configured.
+    #[test]
+    fn choose_list_action_refuses_an_action_the_row_does_not_authorize() {
+        let action = ListActionConfig {
+            id: "tail".to_string(),
+            label: "Tail log".to_string(),
+            command: vec![
+                "tail".to_string(),
+                "-f".to_string(),
+                "--".to_string(),
+                "{log}".to_string(),
+            ],
+            target: ActionTarget::Overlay,
+            ..ListActionConfig::default()
+        };
+        let mut app = test_app_with_job(
+            action,
+            row_with_actions("1", &[], &[("log", "/tmp/slurm-1.out")], &["cancel"]),
+        );
+
+        app.choose_list_action("1", "tail");
+
+        assert!(app.state.list_action_confirm.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("action is not permitted for this job")
+        );
     }
 }

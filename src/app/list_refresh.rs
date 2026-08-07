@@ -47,16 +47,78 @@ pub(crate) enum ListPollOutcome {
     Failed(String),
 }
 
+/// Shared between the poll worker thread and `App::shutdown_list_poll`
+/// (design doc: "Shutdown cancellation"). Holds the in-flight poll's
+/// process-group pid, if any, plus a flag that lets shutdown cancel a poll
+/// that hasn't managed to register its pid yet.
+#[derive(Debug, Default)]
+pub(crate) struct ListPollShared {
+    pid: Option<u32>,
+    shutting_down: bool,
+}
+
+pub(crate) type ListPollChildSlot = Arc<Mutex<ListPollShared>>;
+
+/// RAII guard around a registered process-group pid (finding 2: "use an RAII
+/// guard for the child group so panics and early returns still clean up").
+/// While held, `pid` stays registered in `shared` so `shutdown_list_poll` can
+/// always find and kill it -- including while this worker is blocked joining
+/// the pipe-reader threads, not just while waiting on the child itself.
+/// Dropping the guard (on every return path, including panics unwinding
+/// through `catch_worker_panic`) unconditionally kills the whole process
+/// group one more time and clears the registration. Killing an
+/// already-reaped group is a harmless no-op (`kill(2)` on a vanished pgid).
+struct ChildGroupGuard {
+    shared: ListPollChildSlot,
+    pid: u32,
+}
+
+impl ChildGroupGuard {
+    /// Registers `pid` as the in-flight poll's process group, unless
+    /// shutdown was already requested -- covering "a similar race if
+    /// shutdown happens before the worker records its PID": without this
+    /// check, a poll spawned in the same instant as shutdown could register
+    /// after `shutdown_list_poll` already ran and escape it entirely.
+    fn register(shared: &ListPollChildSlot, pid: u32) -> Result<Self, ()> {
+        let Ok(mut guard) = shared.lock() else {
+            return Err(());
+        };
+        if guard.shutting_down {
+            return Err(());
+        }
+        guard.pid = Some(pid);
+        drop(guard);
+        Ok(Self {
+            shared: shared.clone(),
+            pid,
+        })
+    }
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        kill_process_group(self.pid);
+        if let Ok(mut guard) = self.shared.lock() {
+            if guard.pid == Some(self.pid) {
+                guard.pid = None;
+            }
+        }
+    }
+}
+
 /// What a launched poll was fetching, captured at launch time and compared
-/// against the live mode/command at completion (design doc: "A generation
+/// against the live generation at completion (design doc: "A generation
 /// counter; discard results whose mode or command changed since launch").
-/// A direct value comparison is used instead of a synthetic counter: mode and
-/// command are the only two things that matter, and comparing them directly
-/// can't drift out of sync with whatever actually changed them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `App::list_poll_generation` is bumped on every mode toggle and every
+/// config reload that touches `sidebar_list` -- a monotonic counter rather
+/// than comparing mode/command *values* directly, since a live -> history ->
+/// live round trip while a poll is in flight would otherwise land back on
+/// the same value and let a stale result compare equal (design doc finding:
+/// "the stale-result guard is an identity comparison, not a generation
+/// counter").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ListPollIdentity {
-    pub mode: String,
-    pub command: Vec<String>,
+    pub generation: u64,
 }
 
 impl App {
@@ -101,9 +163,10 @@ impl App {
 
     fn start_list_poll(&mut self, now: Instant) {
         let identity = ListPollIdentity {
-            mode: self.state.jobs.mode.clone(),
-            command: self.state.sidebar_list.command.clone(),
+            generation: self.list_poll_generation,
         };
+        let mode = self.state.jobs.mode.clone();
+        let command = self.state.sidebar_list.command.clone();
         let row = RowContext {
             id: String::new(),
             cells: Vec::new(),
@@ -113,7 +176,7 @@ impl App {
         // substitution table: "`{mode}` | ... command only"); an empty row
         // means `{id}`/`{cellN}`/vars all correctly fail as unresolved rather
         // than silently resolving against nothing.
-        let argv = match resolve_argv(&identity.command, &row, &identity.mode) {
+        let argv = match resolve_argv(&command, &row, &mode) {
             Ok(argv) => argv,
             Err(err) => {
                 // A bad command template is a config problem, not a
@@ -157,30 +220,29 @@ impl App {
     /// (design doc: "Shutdown cancellation"). Called from both run loops on
     /// their way out.
     pub(crate) fn shutdown_list_poll(&mut self) {
-        let pid = self
-            .list_poll_child
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        if let Some(pid) = pid {
+        let Ok(mut guard) = self.list_poll_child.lock() else {
+            return;
+        };
+        // Set unconditionally, even if no pid is registered yet: covers the
+        // spawn/register race where a worker thread is between
+        // `Command::spawn` and `ChildGroupGuard::register` right now, so it
+        // must see `shutting_down` and self-immolate instead of escaping.
+        guard.shutting_down = true;
+        if let Some(pid) = guard.pid.take() {
             kill_process_group(pid);
         }
     }
 
     /// Applies a completed `AppEvent::ListSectionPolled` (design doc: "Result
     /// state"). Discards the outcome if the mode or command has changed since
-    /// the poll launched.
+    /// the poll launched (`list_poll_generation` no longer matches).
     pub(crate) fn handle_list_section_polled(
         &mut self,
         identity: ListPollIdentity,
         outcome: ListPollOutcome,
     ) {
         self.list_poll_in_flight = false;
-        let current = ListPollIdentity {
-            mode: self.state.jobs.mode.clone(),
-            command: self.state.sidebar_list.command.clone(),
-        };
-        if identity == current {
+        if identity.generation == self.list_poll_generation {
             self.apply_list_poll_outcome(outcome, Instant::now());
         } else {
             tracing::debug!(
@@ -292,7 +354,7 @@ fn kill_process_group(_pid: u32) {
 fn run_list_poll(
     argv: &[String],
     timeout: Duration,
-    child_slot: &Arc<Mutex<Option<u32>>>,
+    child_slot: &ListPollChildSlot,
     known_styles: &[String],
 ) -> ListPollOutcome {
     let Some((program, args)) = argv.split_first() else {
@@ -317,9 +379,19 @@ fn run_list_poll(
         Err(err) => return ListPollOutcome::Failed(format!("failed to spawn: {err}")),
     };
     let pid = child.id();
-    if let Ok(mut guard) = child_slot.lock() {
-        *guard = Some(pid);
-    }
+    let guard = match ChildGroupGuard::register(child_slot, pid) {
+        Ok(guard) => guard,
+        Err(()) => {
+            // Shutdown was requested before we could register (design doc
+            // finding 2's spawn/register race): kill immediately rather than
+            // let this child escape shutdown's reach.
+            kill_process_group(pid);
+            let _ = child.wait();
+            return ListPollOutcome::Failed(
+                "list section poll cancelled by shutdown".to_string(),
+            );
+        }
+    };
 
     // Present: spawned with `Stdio::piped()` above.
     let stdout_reader = child
@@ -344,36 +416,35 @@ fn run_list_poll(
                 std::thread::sleep(CHILD_POLL_INTERVAL);
             }
             Err(err) => {
-                kill_process_group(pid);
-                let _ = child.wait();
-                if let Ok(mut guard) = child_slot.lock() {
-                    *guard = None;
-                }
+                // `guard` drops here (kills the group, clears registration)
+                // as this function returns.
                 return ListPollOutcome::Failed(format!("failed to wait for child: {err}"));
             }
         }
     };
 
-    let status = if timed_out {
-        kill_process_group(pid);
-        // Always reap after killing, even though the exit status itself is
-        // moot once timed out (design doc: "Reap. Always wait() after
-        // kill.").
-        let _ = child.wait();
-        None
-    } else {
-        status
-    };
-    if let Ok(mut guard) = child_slot.lock() {
-        *guard = None;
-    }
+    // Whatever became of the leader -- exited cleanly or timed out -- kill
+    // any remaining process-group members *now*, before joining the pipe
+    // readers below. Without this, a leader that exits 0 while a forked
+    // descendant still holds stdout/stderr open leaves the readers blocked
+    // on that descendant's pipe end, possibly forever (design doc finding:
+    // "a poll can wedge forever"). `guard` stays registered through the
+    // joins that follow (not cleared here), so shutdown can still reach this
+    // group for the whole time the readers might be blocked.
+    kill_process_group(pid);
+    // Always reap after killing, even though the exit status itself is moot
+    // once timed out (design doc: "Reap. Always wait() after kill.").
+    let _ = child.wait();
 
-    // Joined after the child is gone (or killed), so the pipes have hit EOF
-    // and these don't block. Both readers ran concurrently while we waited
-    // above (design doc: "Drain both streams concurrently. Reading stdout
-    // while stderr fills its pipe deadlocks.").
+    // Joined after the child (and any stray group members) are gone, so the
+    // pipes have hit EOF and these don't block. Both readers ran
+    // concurrently while we waited above (design doc: "Drain both streams
+    // concurrently. Reading stdout while stderr fills its pipe deadlocks.").
     let stdout_result = stdout_reader.map(|handle| handle.join());
     let stderr_result = stderr_reader.map(|handle| handle.join());
+    // Only now is it safe to drop the registration: the readers can no
+    // longer block on this group.
+    drop(guard);
 
     if timed_out {
         return ListPollOutcome::Failed(format!("timed out after {timeout:?}"));
@@ -386,17 +457,29 @@ fn run_list_poll(
     };
 
     let (stdout_bytes, stdout_truncated) = match stdout_result {
-        Some(Ok(captured)) => captured,
+        Some(Ok(Ok(captured))) => captured,
+        Some(Ok(Err(err))) => {
+            return ListPollOutcome::Failed(format!("failed to read stdout: {err}"))
+        }
         Some(Err(_)) => {
             return ListPollOutcome::Failed("stdout reader thread panicked".to_string())
         }
         None => (Vec::new(), false),
     };
-    // Still joined above so the thread can't leak, but the bytes themselves
-    // aren't needed for anything but debugging today.
-    if let Some(Err(_)) = stderr_result {
-        return ListPollOutcome::Failed("stderr reader thread panicked".to_string());
-    }
+    // A stderr *read* error is treated the same as a stdout one -- both mean
+    // the poll's output can't be trusted (design doc finding: "read errors
+    // become silent EOF"). A stderr *truncation* (>256 KiB) is caught below,
+    // alongside stdout's, once `status.success()` has been checked.
+    let stderr_truncated = match stderr_result {
+        Some(Ok(Ok((_, truncated)))) => truncated,
+        Some(Ok(Err(err))) => {
+            return ListPollOutcome::Failed(format!("failed to read stderr: {err}"))
+        }
+        Some(Err(_)) => {
+            return ListPollOutcome::Failed("stderr reader thread panicked".to_string())
+        }
+        None => false,
+    };
 
     if !status.success() {
         return ListPollOutcome::Failed(format!("exited with {status}"));
@@ -404,6 +487,15 @@ fn run_list_poll(
     if stdout_truncated {
         return ListPollOutcome::Failed(format!(
             "stdout exceeded the {MAX_STREAM_BYTES} byte cap"
+        ));
+    }
+    if stderr_truncated {
+        // Design doc finding: "Valid stdout plus >256 KiB stderr and exit 0
+        // is ACCEPTED instead of marked stale" -- a provider that floods
+        // stderr is misbehaving even if stdout happens to parse, and that
+        // should surface as staleness, not be silently accepted.
+        return ListPollOutcome::Failed(format!(
+            "stderr exceeded the {MAX_STREAM_BYTES} byte cap"
         ));
     }
 
@@ -418,8 +510,11 @@ fn run_list_poll(
 /// Reads from `reader` into a buffer capped at `cap` bytes, returning
 /// `(bytes, true)` if the stream had more data than that. Keeps draining
 /// past the cap rather than stopping there, so a chatty child never blocks on
-/// a full pipe (design doc: "Drain both streams concurrently").
-fn read_capped<R: Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
+/// a full pipe (design doc: "Drain both streams concurrently"). A genuine
+/// I/O error is propagated rather than treated as a clean EOF (design doc
+/// finding: "read errors become silent EOF") -- the caller must not trust a
+/// poll whose read failed partway through.
+fn read_capped<R: Read>(mut reader: R, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut buf = Vec::with_capacity(cap.min(64 * 1024));
     let mut chunk = [0u8; 8192];
     let mut truncated = false;
@@ -438,10 +533,10 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(err) => return Err(err),
         }
     }
-    (buf, truncated)
+    Ok((buf, truncated))
 }
 
 fn describe_parse_failure(err: &ParseFailure) -> String {
@@ -549,8 +644,7 @@ mod tests {
 
         app.handle_list_section_polled(
             ListPollIdentity {
-                mode: app.state.jobs.mode.clone(),
-                command: app.state.sidebar_list.command.clone(),
+                generation: app.list_poll_generation,
             },
             ListPollOutcome::Success(ParsedPayload::default()),
         );
@@ -569,11 +663,11 @@ mod tests {
         let mut app = test_app(&crate::config::Config::default());
         app.list_poll_in_flight = true;
         let launched = ListPollIdentity {
-            mode: "live".to_string(),
-            command: app.state.sidebar_list.command.clone(),
+            generation: app.list_poll_generation,
         };
-        // Mode changed underneath the in-flight poll.
-        app.state.jobs.mode = "history".to_string();
+        // Something (mode toggle, config reload) bumped the generation
+        // underneath the in-flight poll.
+        app.list_poll_generation = app.list_poll_generation.wrapping_add(1);
 
         app.handle_list_section_polled(
             launched,
@@ -587,12 +681,41 @@ mod tests {
         assert_eq!(app.state.jobs.title, None);
     }
 
+    /// Finding 12: toggling live -> history -> live while a poll is in
+    /// flight must NOT let the stale result compare equal just because the
+    /// mode string ended up back where it started -- the generation must
+    /// have moved on regardless.
+    #[test]
+    fn a_mode_round_trip_back_to_the_original_value_still_discards_the_stale_result() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.list_poll_in_flight = true;
+        let launched = ListPollIdentity {
+            generation: app.list_poll_generation,
+        };
+        // live -> history -> live: two generation bumps, ending on the same
+        // mode string the poll originally launched under.
+        app.list_poll_generation = app.list_poll_generation.wrapping_add(1);
+        app.list_poll_generation = app.list_poll_generation.wrapping_add(1);
+
+        app.handle_list_section_polled(
+            launched,
+            ListPollOutcome::Success(ParsedPayload {
+                title: Some("stale".to_string()),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            app.state.jobs.title, None,
+            "a result launched two generations ago must be discarded even if mode round-tripped"
+        );
+    }
+
     #[test]
     fn matching_identity_result_is_applied() {
         let mut app = test_app(&crate::config::Config::default());
         let identity = ListPollIdentity {
-            mode: app.state.jobs.mode.clone(),
-            command: app.state.sidebar_list.command.clone(),
+            generation: app.list_poll_generation,
         };
 
         app.handle_list_section_polled(
@@ -736,7 +859,8 @@ mod tests {
     #[test]
     fn read_capped_reads_everything_under_the_cap() {
         let data = b"hello world".to_vec();
-        let (bytes, truncated) = read_capped(std::io::Cursor::new(data.clone()), 1024);
+        let (bytes, truncated) =
+            read_capped(std::io::Cursor::new(data.clone()), 1024).expect("read should succeed");
         assert_eq!(bytes, data);
         assert!(!truncated);
     }
@@ -744,9 +868,79 @@ mod tests {
     #[test]
     fn read_capped_truncates_and_flags_when_over_the_cap() {
         let data = vec![b'x'; 100];
-        let (bytes, truncated) = read_capped(std::io::Cursor::new(data), 10);
+        let (bytes, truncated) =
+            read_capped(std::io::Cursor::new(data), 10).expect("read should succeed");
         assert_eq!(bytes.len(), 10);
         assert!(truncated);
+    }
+
+    /// Finding 10: a genuine I/O error must not be swallowed into a clean
+    /// EOF -- the caller has to be able to tell "stream ended" from "stream
+    /// broke partway through".
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    #[test]
+    fn read_capped_propagates_io_errors_instead_of_treating_them_as_eof() {
+        assert!(read_capped(FailingReader, 1024).is_err());
+    }
+
+    // -- ChildGroupGuard / shutdown race --------------------------------------
+
+    fn empty_child_slot() -> ListPollChildSlot {
+        Arc::new(Mutex::new(ListPollShared::default()))
+    }
+
+    /// Finding 2: "a similar race if shutdown happens before the worker
+    /// records its PID" -- once shutdown is requested, a worker that hasn't
+    /// registered yet must not be allowed to register afterward.
+    #[test]
+    fn child_group_guard_register_fails_once_shutdown_is_requested() {
+        let shared = empty_child_slot();
+        {
+            let mut guard = shared.lock().expect("lock");
+            guard.shutting_down = true;
+        }
+        assert!(ChildGroupGuard::register(&shared, 999_999).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_group_guard_drop_kills_the_group_and_clears_registration() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let shared = empty_child_slot();
+        let guard = ChildGroupGuard::register(&shared, pid).expect("register");
+        assert_eq!(shared.lock().expect("lock").pid, Some(pid));
+
+        drop(guard);
+
+        assert_eq!(shared.lock().expect("lock").pid, None);
+        // Reap so a killed-but-unreaped zombie doesn't make the liveness
+        // check below see it as still alive (`kill(pid, 0)` succeeds against
+        // a zombie until it's waited on).
+        let _ = child.wait();
+        let still_alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        assert!(!still_alive, "dropping the guard should kill the group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_list_poll_prevents_a_racing_registration_afterward() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.shutdown_list_poll();
+        assert!(ChildGroupGuard::register(&app.list_poll_child, 999_999).is_err());
     }
 
     // -- subprocess integration (Unix-only: process groups, /bin/sh) ------------
@@ -760,7 +954,7 @@ mod tests {
             "-c".to_string(),
             format!("echo '{json}'"),
         ];
-        let outcome = run_list_poll(&argv, Duration::from_secs(5), &Arc::new(Mutex::new(None)), &[]);
+        let outcome = run_list_poll(&argv, Duration::from_secs(5), &empty_child_slot(), &[]);
         match outcome {
             ListPollOutcome::Success(payload) => {
                 assert_eq!(payload.title.as_deref(), Some("JOBS"));
@@ -773,7 +967,7 @@ mod tests {
     #[test]
     fn run_list_poll_fails_on_non_zero_exit() {
         let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "exit 7".to_string()];
-        let outcome = run_list_poll(&argv, Duration::from_secs(5), &Arc::new(Mutex::new(None)), &[]);
+        let outcome = run_list_poll(&argv, Duration::from_secs(5), &empty_child_slot(), &[]);
         assert!(matches!(outcome, ListPollOutcome::Failed(_)));
     }
 
@@ -781,7 +975,32 @@ mod tests {
     #[test]
     fn run_list_poll_fails_on_spawn_error() {
         let argv = vec!["/this/does/not/exist-herdr-poll-test".to_string()];
-        let outcome = run_list_poll(&argv, Duration::from_secs(5), &Arc::new(Mutex::new(None)), &[]);
+        let outcome = run_list_poll(&argv, Duration::from_secs(5), &empty_child_slot(), &[]);
+        assert!(matches!(outcome, ListPollOutcome::Failed(_)));
+    }
+
+    /// Finding 2's headline scenario: the leader exits 0 immediately but
+    /// forks a descendant that inherits stdout and outlives it. Without
+    /// killing the remaining process group before joining the pipe readers,
+    /// this poll would block until the descendant exits (here, 30s) instead
+    /// of completing promptly.
+    #[cfg(unix)]
+    #[test]
+    fn a_leaked_descendant_holding_stdout_open_does_not_wedge_the_poll() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo done; (sleep 30) &".to_string(),
+        ];
+        let start = Instant::now();
+        let outcome = run_list_poll(&argv, Duration::from_secs(5), &empty_child_slot(), &[]);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "poll should not block on a leaked descendant's inherited stdout, took {:?}",
+            start.elapsed()
+        );
+        // "done" isn't valid JSON, so parsing fails -- what matters here is
+        // that the poll returned promptly at all rather than wedging.
         assert!(matches!(outcome, ListPollOutcome::Failed(_)));
     }
 
@@ -806,7 +1025,7 @@ mod tests {
         let outcome = run_list_poll(
             &argv,
             Duration::from_millis(200),
-            &Arc::new(Mutex::new(None)),
+            &empty_child_slot(),
             &[],
         );
         assert!(matches!(outcome, ListPollOutcome::Failed(ref msg) if msg.contains("timed out")));

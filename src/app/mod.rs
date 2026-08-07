@@ -134,12 +134,23 @@ pub struct App {
     pub(crate) last_list_poll_success: Option<Instant>,
     pub(crate) list_poll_in_flight: bool,
     pub(crate) list_poll_due_after_in_flight: bool,
-    /// pid of the currently in-flight poll's process group, if any.
-    /// Populated by the poll worker thread right after spawn and cleared
-    /// when it exits; read by `shutdown_list_poll` so the group can still be
-    /// killed even though the generic child tracker (`runtime.rs:12`) never
-    /// kills children on exit.
-    pub(crate) list_poll_child: Arc<Mutex<Option<u32>>>,
+    /// Bumped on every mode or command change (design doc finding: "the
+    /// stale-result guard is an identity comparison, not a generation
+    /// counter" -- comparing mode/command *values* lets a result launched
+    /// under mode A, delivered after A -> B -> A, compare equal to the
+    /// current state and be wrongly applied, even though state changed
+    /// twice in between). Captured into `ListPollIdentity` at launch and
+    /// compared against the live value at completion.
+    pub(crate) list_poll_generation: u64,
+    /// Shared with the poll worker thread: the in-flight poll's process-group
+    /// pid (if any) plus a shutdown-cancellation flag. Populated by the poll
+    /// worker right after spawn and kept registered until its pipe readers
+    /// finish (`list_refresh::ChildGroupGuard`); read by `shutdown_list_poll`
+    /// so the group can still be killed even though the generic child
+    /// tracker (`runtime.rs:12`) never kills children on exit. The flag
+    /// covers the race where shutdown happens before the worker manages to
+    /// register its pid at all.
+    pub(crate) list_poll_child: crate::app::list_refresh::ListPollChildSlot,
     /// Bumped every time a Jobs sidebar action is launched (design doc:
     /// "Actions"), so a background command's completion event can be matched
     /// against the confirm dialog that launched it -- see
@@ -699,14 +710,19 @@ impl App {
             agent_view_override: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
-            sidebar_list: config.ui.sidebar.list.clone(),
+            // Design doc finding: an invalid `ui.sidebar.list` subsection
+            // (e.g. `timeout_seconds >= refresh_seconds`) must not be run
+            // just because it was reported as a diagnostic -- `sanitized()`
+            // disables it instead. There's no "previous config" to fall
+            // back to yet at startup, unlike the live-reload path below.
+            sidebar_list: config.ui.sidebar.list.sanitized(),
             jobs: state::JobsSectionState {
                 collapsed: jobs_collapsed,
                 mode: jobs_mode,
                 ..state::JobsSectionState::default()
             },
             list_notify_queue: std::collections::VecDeque::new(),
-            list_notify_seen: std::collections::HashSet::new(),
+            list_notify_seen: crate::app::list_notify::BoundedIdSet::default(),
             list_action_confirm: None,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
@@ -838,7 +854,8 @@ impl App {
             last_list_poll_success: None,
             list_poll_in_flight: false,
             list_poll_due_after_in_flight: false,
-            list_poll_child: Arc::new(Mutex::new(None)),
+            list_poll_generation: 0,
+            list_poll_child: Arc::new(Mutex::new(crate::app::list_refresh::ListPollShared::default())),
             next_list_action_generation: 1,
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
@@ -1610,7 +1627,23 @@ impl App {
                 self.state.status_indicators = config.ui.status_indicators;
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
-                self.state.sidebar_list = config.ui.sidebar.list.clone();
+                // Design doc finding: "invalid cadence/timeout is diagnosed
+                // but still applied... live reload does not even collect
+                // list diagnostics." Validate `ui.sidebar.list` before
+                // applying it; on violation, retain whatever list config was
+                // already live rather than adopt a broken one.
+                let list_diagnostics = config.ui.sidebar.list.diagnostics();
+                if list_diagnostics.is_empty() {
+                    self.state.sidebar_list = config.ui.sidebar.list.clone();
+                    // The command (and thus any in-flight poll's meaning)
+                    // may have just changed; see `list_poll_generation`'s
+                    // doc comment.
+                    self.list_poll_generation = self.list_poll_generation.wrapping_add(1);
+                } else {
+                    diagnostics.extend(list_diagnostics.into_iter().map(|diagnostic| {
+                        format!("{diagnostic}; keeping previous ui.sidebar.list settings")
+                    }));
+                }
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
@@ -3302,6 +3335,73 @@ mod tests {
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(app.state.sidebar_agents, previous_agents);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Finding 8: an invalid `ui.sidebar.list` subsection (here,
+    /// `timeout_seconds >= refresh_seconds`) is diagnosed but must not
+    /// actually be applied -- live reload must retain the previous, valid
+    /// list config rather than adopt the broken one.
+    #[test]
+    fn reload_config_rejects_an_invalid_list_section_and_keeps_the_previous_one() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-list-invalid-cadence");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let previous_list = app.state.sidebar_list.clone();
+
+        std::fs::write(
+            &path,
+            "[ui.sidebar.list]\nrefresh_seconds = 1\ntimeout_seconds = 60\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("timeout_seconds") && d.contains("refresh_seconds")),
+            "diagnostics were {:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            app.state.sidebar_list, previous_list,
+            "an invalid list section must not overwrite the previous valid one"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A valid `ui.sidebar.list` reload, by contrast, must still apply and
+    /// bump `list_poll_generation` (design doc finding 12: discard a
+    /// still-in-flight poll launched under the old command).
+    #[test]
+    fn reload_config_applies_a_valid_list_section_and_bumps_the_poll_generation() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-list-valid-cadence");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let generation_before = app.list_poll_generation;
+
+        std::fs::write(
+            &path,
+            "[ui.sidebar.list]\nrefresh_seconds = 30\ntimeout_seconds = 5\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.sidebar_list.refresh_seconds, 30);
+        assert_ne!(app.list_poll_generation, generation_before);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
