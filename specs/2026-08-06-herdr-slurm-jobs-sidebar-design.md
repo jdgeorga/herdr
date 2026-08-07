@@ -1,9 +1,9 @@
 # Herdr SLURM jobs sidebar — design
 
-**Date:** 2026-08-06
-**Status:** approved, ready for implementation planning
+**Date:** 2026-08-06 (rev 2, after adversarial review)
+**Status:** approved, ready for implementation
 **Base:** herdr v0.8.0 (`69a07fd`), Apache-2.0, github.com/herdrdev/herdr
-**Target platform:** NERSC Perlmutter login nodes (Linux, SLURM 25.11.6)
+**Target:** NERSC Perlmutter login nodes (Linux, SLURM 25.11.6)
 
 ## Problem
 
@@ -12,60 +12,262 @@ worth watching continuously is the batch queue. Today that means a separate
 `watch squeue` pane, which costs a pane and carries no connection to the
 workspaces the jobs came from.
 
-We want a third sidebar section listing the user's SLURM jobs, grouped into
-Running / Queued / recently-Done, refreshing every ~10 seconds, with cancel and
-tail-log actions.
+Add a third sidebar section listing the user's SLURM jobs, grouped Running /
+Queued / recently-Done, refreshing every ~10 seconds, with cancel and tail-log
+actions.
 
-## Decisions already settled
+## Revision note
+
+Rev 1 was reviewed against the source by GPT-5.6 Sol and rejected as
+implementation-ready. Its substantive findings are incorporated here. The
+corrections that changed the design, not just the prose:
+
+- **The "carve inside `render_sidebar`" plan was wrong.** `compute_view`
+  (`src/ui.rs:246`) normalizes scroll against the *full* sidebar rect, and
+  `ViewState` stores `workspace_card_areas` (`src/app/state.rs:803`) consumed by
+  both rendering and hit-testing. Carving in one place only would silently
+  desync geometry. Replaced with a single computed `SidebarLayout`.
+- **The sidebar toggle already lives at the bottom** of the sidebar
+  (`expanded_sidebar_toggle_rect`, `src/ui/sidebar.rs:1552`), colliding with
+  bottom-placed Jobs. Now explicitly reserved.
+- **`Mode::ConfirmRemoveWorktree` is a unit variant**; its payload lives in a
+  separate `WorktreeRemoveState` (`src/app/state.rs:663`). Rev 1 described it as
+  payload-carrying.
+- **`resolved_token_spans` is not a generic truncation helper** — it is bound to
+  sidebar `ResolvedTokenKind` semantics. Use `truncate_end` (`src/ui/text.rs:3`)
+  and compute columns independently.
+- **`App::run` is in `src/app/mod.rs:903`**, not `src/app/runtime.rs`, and the
+  two loops share deadline logic rather than duplicating it.
+- **tokio has no `process` feature** (`Cargo.toml:41`). Use `std::process`.
+- **`AppState.toast` is a single slot** (`src/app/state.rs:1484`) with three
+  `ToastKind` variants. Provider notifications need a queue.
+- **`~` is not expanded under argv execution.** Rev 1's example config was
+  unrunnable.
+- Rev 1's claim that a bad config section silently resets unrelated settings is
+  outdated for live reload (`src/config/io.rs:218`).
+
+Sol also recommended cutting linger, history, notifications and provider
+styling from v1. Those are kept, because in this architecture they are almost
+entirely *provider-side*: the linger buffer, the sacct exit lookup and the
+history query are Python, and the Rust cost is a style-name lookup table, a
+bounded notify queue, and a mode string. The review's estimate of their cost
+assumed they were Rust features. Its correctness findings are adopted in full;
+its scope recommendation is not.
+
+## Decisions
 
 | Question | Decision |
 | --- | --- |
-| Job scope | All the user's jobs — `squeue -u $USER`, not just jobs launched from Herdr |
+| Job scope | All the user's jobs — `squeue -u $USER` |
 | Mechanism | Generic external-command section in Rust; SLURM logic in a provider script |
-| Distribution | Personal fork; upstream only after a maintainer Discussion (see Constraints) |
-| Cluster scope | Perlmutter only. No SSH, no multi-site |
-| Interaction | Mouse-only in v1. Cancel + tail-log |
+| Distribution | Personal fork; upstream only after a maintainer Discussion |
+| Cluster | Perlmutter only |
+| Interaction | Mouse-only in v1. Left click selects, right click opens a context menu |
 | Row density | One line per job |
-| Placement | Bottom of sidebar, collapsed to a summary line by default |
+| Placement | Bottom of sidebar, above the toggle row, collapsed by default |
 | Finished jobs | Linger 10 minutes as Done/Failed, green/red, with a notification |
-| History | A `[live|HIST]` toggle swaps the same box to the last 10 jobs |
+| History | A header toggle swaps the box to the last 10 jobs |
 | Notifications | In-TUI toasts only |
-| Toolchain | NERSC `rust/stable` module with redirected `RUSTUP_HOME`/`CARGO_HOME` |
-| Install | Replace `~/.local/bin/herdr`, disable the update check |
+| Headless | Polling pauses when no TUI client is attached |
 
 ## Architecture
 
 Two components, split along the axis of what changes often.
 
-### 1. Generic list section (Rust, in the fork)
+**Generic list section (Rust).** Runs a configured command on an interval,
+parses JSON, renders grouped rows, dispatches configured actions. Contains no
+SLURM knowledge.
 
-A third sidebar section that runs a configured command on an interval, parses
-JSON from its stdout, renders grouped rows, and dispatches configured actions.
-It contains no SLURM knowledge — no mention of squeue, job IDs, or node counts.
+**SLURM provider (Python).** Owns the squeue invocation, the 10-minute linger
+buffer, the sacct exit-code lookup, history mode, and when to notify.
 
-### 2. SLURM provider (Python, in `~/.config/herdr/scripts/`)
+Interpreter: bare `python3` on NERSC login nodes is **3.6.15**. Invoke
+`/usr/bin/python3.11` (verified 3.11.15) by absolute path.
 
-Owns everything SLURM-specific: the squeue invocation and its field layout, the
-10-minute linger buffer for finished jobs, the sacct exit-code lookup, history
-mode, and the decision of when to emit a notification.
+## Layout — one source of truth
 
-Interpreter: bare `python3` on NERSC login nodes is **3.6.15**. The provider is
-invoked as `/usr/bin/python3.11` explicitly. Do not rely on `python3` resolving
-to anything modern, and do not assume the interpreter is the same one used by
-other tooling on the node. Alternatively the script may be written 3.6-clean —
-no f-string `=`, no dataclasses, no walrus — but pinning 3.11 is preferred since
-the path is stable and the provider is ours.
+This is the central correctness requirement. All sidebar geometry is computed
+**once**, in `compute_view` (`src/ui.rs`), into a `SidebarLayout` stored on
+`ViewState`. Rendering and hit-testing both read it. Neither recomputes.
 
-The split matters because every part the user will keep adjusting — grouping,
-linger duration, which fields show, what counts as a failure — lives in the
-script. Adjusting the display costs a 10-second poll, not a rebuild of 266
-crates.
+```rust
+pub struct SidebarLayout {
+    pub jobs: Rect,                 // empty when hidden
+    pub jobs_collapsed: bool,
+    pub spaces: Rect,
+    pub agents: Rect,
+    pub section_divider_y: Option<u16>,
+    pub toggle: Rect,
+    pub jobs_rows: Vec<JobRowHit>,  // per visible row: rect + row id + group id
+    pub jobs_scrollbar: Option<Rect>,
+    pub jobs_header_hits: JobsHeaderHits, // chevron rect, mode-toggle rect
+}
+```
+
+Allocation order, top to bottom, and the reason it must be this order:
+
+1. Reserve the rightmost column (the sidebar's vertical border), as
+   `expanded_sidebar_sections` already does (`src/ui/sidebar.rs:60`).
+2. Reserve the bottom toggle row.
+3. Allocate Jobs from the bottom of what remains.
+4. Apply the existing Spaces/Agents `split_ratio` to the **remainder**.
+
+The divider rect and the drag-to-ratio conversion must both be computed against
+that same remainder. `set_sidebar_section_split` currently converts a dragged
+row into a ratio using the full sidebar height (`src/app/input/sidebar.rs:290`);
+if rendering applies the ratio post-carve while dragging computes it pre-carve,
+the divider jumps. Carving *after* applying the ratio is also wrong — it steals
+rows from Agents and breaks the existing three-row minimum.
+
+### Degradation policy
+
+Jobs never starves the existing sections. Given usable height `H` (after border
+and toggle), with Spaces and Agents each requiring 3 rows:
+
+| Available | Jobs gets |
+| --- | --- |
+| `H - 6 >= wanted` | `wanted` = min(content rows, `max_visible_rows`) |
+| `1 <= H - 6 < wanted` | `H - 6`, with a scrollbar |
+| `H - 6 < 1` | one row, collapsed header only |
+| `H < 7` | hidden entirely; layout falls through to today's two-way behaviour |
+
+`max_visible_rows` counts **all** rows the section draws — section header, group
+headers, and job rows alike — so the section's total height is predictable from
+config alone.
+
+Collapsed mode is asymmetric and needs its own path.
+`collapsed_sidebar_sections` returns `(Rect, Option<u16>, Rect)`
+(`src/ui/sidebar.rs:728`), ignores `split_ratio`, uses a fixed half split, and
+drops Agents entirely below seven rows. Do not assume symmetry with the expanded
+path; write and test the two carves separately.
+
+### Call sites to update
+
+Every consumer of the old two-way geometry moves to `SidebarLayout`:
+
+- `src/ui.rs:248` — view computation and agent scroll clamping
+- `src/ui/sidebar.rs:439` — workspace-list geometry
+- `src/ui/sidebar.rs:658` — `compute_workspace_list_areas`
+- `src/ui/sidebar.rs:775` — collapsed rendering
+- `src/ui/sidebar.rs:996` — sidebar rendering
+- `src/app/input/sidebar.rs:22` — agent-panel hit geometry
+- `src/app/input/sidebar.rs:275` — divider hit test
+- `src/app/input/sidebar.rs:324`, `:341` — collapsed Spaces/Agents hit testing
+- `src/app/input/sidebar.rs:473` — agent-sort click target
+- `src/app/actions.rs:1562` — ensure-agent-visible scrolling
+
+Tests calling the old helpers directly (`src/ui/sidebar.rs:1665`, `:1716`,
+`:1888`, `:1918`, `:2165`, `:2232`, `:2266`, `:2294`, `:2335`, `:2385`, `:2507`;
+`src/ui.rs:1071`; `src/app/input/sidebar.rs:855`, `:901`, `:1080`, `:1125`) keep
+passing unchanged when Jobs is disabled — that is the regression bar. The
+existing two-way helpers stay, and `SidebarLayout` calls them on the remainder.
+
+## Mouse contract
+
+Three mouse paths currently assume every sidebar click belongs to Spaces or
+Agents and must each intercept Jobs first:
+
+- `src/app/input/mouse.rs:519` — click routing
+- `src/app/input/mouse.rs:967` — wheel routing
+- `src/app/input/mouse.rs:1019` — right click as workspace click
+
+| Gesture | Target | Result |
+| --- | --- | --- |
+| Left click | section header chevron | collapse / expand, persisted |
+| Left click | mode toggle in header | cycle `live` ↔ `history`, immediate re-poll |
+| Left click | group header chevron | collapse / expand that group |
+| Left click | job row | select it (selection is visual only) |
+| Right click | job row | open context menu |
+| Wheel | anywhere in jobs rect | scroll jobs |
+
+Actions live in a **context menu**, not inline buttons — 24 columns has no room
+for them. Extend the existing `ContextMenuKind` (`src/app/state.rs:1230`), whose
+`items()` returns a static slice per variant, with:
+
+```rust
+ContextMenuKind::Job { row_id, can_tail }
+```
+
+returning `["Cancel job", "Tail log", "Copy job ID"]`, with "Tail log" omitted
+when `can_tail` is false. This reuses the whole existing menu render, keyboard,
+and mouse stack rather than inventing hit targets inside a 24-column row.
+
+Selection is identified by row **id**, not index, so it survives a poll that
+reorders rows. A selection whose id vanishes is cleared.
+
+Scrolling needs more than `render_scrollbar` (`src/ui/scrollbar.rs:135`), which
+only draws. Scroll metrics, track and thumb rects, click and drag handling all
+follow the pattern Spaces and Agents each implement separately
+(`src/app/input/sidebar.rs:26`, `:105`).
+
+## Polling
+
+The poller is **server-side**. `ClientState` is a blit decoder with no
+application state; `HeadlessServer` owns the single `app::App`
+(`src/server/headless.rs:4709`).
+
+`start_git_status_refresh_if_due` (`src/app/git_refresh.rs:36`) is the
+scheduling template: deadline check, in-flight flag set before spawn, blocking
+work on a detached thread, result delivered by internal event
+(`src/app/git_refresh.rs:67`), deadline suppressed while in flight (`:95`).
+It is **not** a subprocess template — it provides no timeout, no child handle,
+no cancellation, no output limits.
+
+Both scheduled-task handlers need the trigger, because they are duplicated:
+`src/app/runtime.rs:282` (monolithic) and `src/server/headless.rs:4327`
+(headless, the default launch path). The *deadline builder* is shared
+(`src/app/runtime.rs:560`) and needs one change, not two.
+
+Headless git refresh is gated on an attached app client
+(`src/server/headless.rs:4397`). Jobs polling follows the same gate: **no TUI
+client attached, no polling.** This is a login node, and nobody sees a toast
+raised into an unattached session. Nothing is lost — the provider owns the
+linger state on disk, so it reconstructs what changed on the next poll after
+reattach.
+
+### Subprocess requirements
+
+Use `std::process::Command`; tokio's `process` feature is not enabled and this
+design does not add it.
+
+- **Single-flight.** One poll outstanding at a time. A poll that overruns the
+  interval stretches the cadence rather than overlapping.
+- **Timeout** of `timeout_seconds` (default 5), strictly less than the 10s
+  cadence.
+- **Process group.** Spawn with `process_group(0)` and kill the whole group.
+  Killing only Python orphans `squeue`/`sacct`.
+- **Reap.** Always `wait()` after kill.
+- **Bounded output.** Cap stdout and stderr (256 KiB each) before parsing.
+- **Drain both streams concurrently.** Reading stdout while stderr fills its
+  pipe deadlocks.
+- **Generation counter.** A result is discarded if the mode or the configured
+  command changed since it was launched.
+- **Always deliver completion.** Spawn failure, read failure, parse failure,
+  timeout and worker panic all send a completion event. An in-flight flag that
+  can stick means polling silently dies forever.
+- **Shutdown cancellation.** The generic child tracker only calls `try_wait`
+  (`src/app/runtime.rs:12`) and does not kill children on exit. The poller
+  registers its own shutdown hook.
+
+### Result state
+
+Retaining the previous rows on failure is not enough on its own; the UI must say
+so. State carries `last_success`, `last_attempt`, `last_error`, `is_stale`. A
+*valid empty* result clears rows. Empty stdout, malformed JSON, non-zero exit,
+timeout, schema mismatch and oversized output all retain prior rows and mark
+them stale, with the last-success time shown in the header.
+
+Internal events default to render-impact (`src/app/api.rs:61`) and both loops
+mark rendering needed (`src/app/mod.rs:1121`, `src/server/headless.rs:785`), so
+the handler reports impact correctly rather than calling render-dirty and
+client-notify by hand.
 
 ## Provider protocol
 
-The command is invoked fresh on each poll and writes a single JSON object to
-stdout. Non-zero exit or unparseable output surfaces as an error row in the
-section and leaves the previous rows in place.
+Fixed, versioned schema. Rejected the alternative of a column-mapping DSL:
+herdr needs stable identity, bounded columns, validation and predictable action
+values, and a pass-through protocol pushes that complexity into config while
+making adversarial output harder to contain.
 
 ```json
 {
@@ -73,344 +275,270 @@ section and leaves the previous rows in place.
   "title": "JOBS",
   "summary": "2R  1Q  1✓",
   "groups": [
-    {
-      "id": "running",
-      "label": "Running",
-      "rows": [
-        {
-          "id": "55241874",
-          "cells": ["ued", "4N", "1:23:45"],
-          "style": "normal",
-          "vars": {
-            "log": "/pscratch/sd/j/jdgeorga/ued/slurm-55241874.out",
-            "dir": "/pscratch/sd/j/jdgeorga/ued"
-          },
-          "actions": ["cancel", "tail"]
-        }
-      ]
-    }
-  ],
-  "notify": [{ "level": "ok", "text": "55241874 (ued) finished" }]
+    { "id": "running", "label": "Running", "rows": [
+      { "id": "55241874",
+        "cells": ["ued", "4N", "1:23:45"],
+        "style": "normal",
+        "vars": { "log": "/pscratch/sd/j/jdgeorga/ued/slurm-55241874.out",
+                  "dir": "/pscratch/sd/j/jdgeorga/ued" },
+        "actions": ["cancel", "tail"] } ] } ],
+  "notify": [ { "id": "done-55241874", "level": "ok", "text": "55241874 (ued) finished" } ]
 }
 ```
 
-Field notes:
+Rules, all of which the parser enforces:
 
-- `id` — stable row identity. Substituted into action commands as `{id}`.
-- `cells` — positional, matched against the configured `columns`. Excess cells
-  are dropped; missing cells render blank.
-- `style` — a *name*, not a color. Resolved against `[ui.sidebar.list.styles]`
-  so rows follow the active theme instead of hardcoding hex in Python.
-- `vars` — arbitrary string map, available to action templates as `{name}`.
-- `actions` — IDs of configured actions enabled for this row. An action not
-  listed renders disabled. This is how tail-log is suppressed on pending jobs.
-- `notify` — zero or more toasts to raise this poll. The provider decides when;
-  Rust just displays them. `level` is one of `ok`, `warn`, `fail`, `info`.
+- `version` required; a mismatch is an error, not a warning.
+- Unknown object fields are ignored; unknown enum values (`style`, `level`) fall
+  back to `normal`/`info` with a diagnostic.
+- Row `id` is globally unique across groups. Duplicates: first wins, rest
+  dropped with a diagnostic. Same for group and notify ids.
+- One invalid row is dropped; the rest of the payload is still applied.
+- `style` is a name resolved against config, never a color.
+- `notify[].id` is required and used for deduplication — a provider that
+  re-reports the same event on the next poll must not re-toast.
+- Caps: 200 groups, 2000 rows, 16 cells/row, 32 vars/row, 1 KiB per string,
+  256 KiB total. Exceeding any cap fails the payload as oversized.
+- All strings are stripped of control characters and escape sequences before
+  they reach the renderer. A job name is untrusted input.
+- `summary` renders on the collapsed header line.
 
-`summary` renders on the collapsed header line, so the box is useful without
-being expanded.
-
-### Substitution vocabulary
-
-Action `command` and `confirm` templates accept:
+### Substitution
 
 | Token | Resolves to |
 | --- | --- |
 | `{id}` | the row's `id` |
 | `{cell0}`, `{cell1}`, … | the row's `cells` by index |
 | `{<name>}` | the matching key in the row's `vars` |
-| `{mode}` | the section's current mode (in `command` only) |
+| `{mode}` | the section's current mode (`command` only) |
 
-An unresolved token is a hard error: the action is refused and a toast explains
-which token was missing, rather than executing a command with a literal `{log}`
-in its argv.
+`{{` and `}}` are literal braces. `vars` may not shadow `id`, `cellN` or `mode`.
+An unresolved token refuses the action and toasts which token was missing,
+rather than executing a literal `{log}`.
+
+## Actions
+
+`Mode::ConfirmListAction` is a unit variant, matching how every other
+confirmation in this codebase works. The payload lives in a separate state
+struct, mirroring `WorktreeRemoveState`:
+
+```rust
+pub struct ListActionConfirmState {
+    pub action_id: String,
+    pub label: String,
+    pub argv: Vec<String>,      // fully resolved
+    pub cwd: Option<PathBuf>,   // fully resolved
+    pub prompt: String,
+    pub generation: u64,
+    pub in_progress: bool,
+    pub error: Option<String>,
+}
+```
+
+argv and cwd are resolved **when the menu item is chosen** and frozen. Never
+re-resolve after confirmation: the row may be gone, its id reused, or the config
+reloaded. Re-resolving is a time-of-check/time-of-use bug.
+
+Confirmation is **Enter to accept, Escape to cancel**, matching the existing
+modals — not y/n.
+
+**Tail-log** uses `spawn_overlay_argv_command`
+(`src/app/input/navigate.rs:1045`), which takes `argv`, `cwd`, `extra_env` and
+temp-file guards. It creates a real PTY-backed pane and splits the pane tree;
+the caller must integrate the returned `NewPane` as the scrollback caller does
+(`src/app/input/navigate.rs:949`). Closing the pane terminates `tail` through
+the pane runtime's HUP/TERM/KILL sequence (`src/pane.rs:1229`).
+
+### Security
+
+argv execution avoids shell metacharacter injection, but the boundary that
+matters is untrusted *provider output* interpolated into trusted *user config*.
+Controls:
+
+- No substitution in `argv[0]`. The executable is config-only.
+- `--` before substituted positionals: `["scancel", "--", "{id}"]`,
+  `["tail", "-f", "--", "{log}"]`. Without it a row id of `-A` is a flag.
+- Per-action validation: `{id}` for `cancel` must match `^[0-9]+(_[0-9]+)?(\+[0-9]+)?$`
+  (plain, array and heterogeneous job ids). Not one generic regex for everything.
+- `{log}` and `{dir}` must be absolute, canonicalized, and existing. `tail` will
+  happily display any file the user can read.
+- Never invoke a shell.
+- Paths in config are absolute or `~`-expanded explicitly. Argv execution does
+  no tilde expansion (herdr expands `~` only in coded paths such as
+  `src/worktree.rs:56`), so rev 1's `"~/.config/..."` example was unrunnable.
 
 ## Configuration
 
 ```toml
 [ui.sidebar.list]
 enabled = true
-placement = "bottom"          # "top" | "bottom"
-collapsed = true              # initial state; runtime changes persist
+placement = "bottom"
+collapsed = true
 refresh_seconds = 10
+timeout_seconds = 5
 max_visible_rows = 12
 command = ["/usr/bin/python3.11", "~/.config/herdr/scripts/herdr-jobs.py", "--mode", "{mode}"]
-modes = ["live", "history"]   # first is default; header toggle cycles
-timeout_seconds = 5
+modes = ["live", "history"]
 
 columns = [
-  { width = "fill", align = "left"  },   # directory, truncates with …
-  { width = 3,      align = "right" },   # 4N / 16N
-  { width = 7,      align = "right" },   # 1:23:45
+  { width = "fill", align = "left"  },
+  { width = 3,      align = "right" },
+  { width = 7,      align = "right" },
 ]
 
 [ui.sidebar.list.styles]
-ok     = "#b8bb26"
-fail   = "#fb4934"
-warn   = "#fabd2f"
-muted  = "#928374"
-normal = "#ebdbb2"
+ok = "#b8bb26"; fail = "#fb4934"; warn = "#fabd2f"
+muted = "#928374"; normal = "#ebdbb2"
 
 [[ui.sidebar.list.actions]]
-id = "cancel"
-label = "cancel"
-command = ["scancel", "{id}"]
+id = "cancel"; label = "Cancel job"
+command = ["scancel", "--", "{id}"]
 confirm = "Cancel job {id} ({cell0})?"
-target = "background"         # default when omitted
+validate = { id = "^[0-9]+(_[0-9]+)?(\\+[0-9]+)?$" }
 
 [[ui.sidebar.list.actions]]
-id = "tail"
-label = "tail"
-command = ["tail", "-f", "{log}"]
-target = "overlay"            # "overlay" | "background"
+id = "tail"; label = "Tail log"
+command = ["tail", "-f", "--", "{log}"]
+target = "overlay"
 cwd = "{dir}"
 ```
 
-Action targets in v1: `overlay` runs the command in a full-screen overlay via
-`spawn_overlay_argv_command`; `background` runs it detached and reports the
-result as a toast (this is what `cancel` uses). Opening a persistent split pane
-is deferred — it needs pane-tree plumbing that the overlay path avoids.
+`config.toml` paths are `~`-expanded by the config loader before argv
+construction. Exactly one list section in v1.
 
-Exactly one list section in v1. A map of named sections is a natural later
-extension but is not built now.
+Cell rendering uses `truncate_end` (`src/ui/text.rs:3`) against
+independently-computed column rects. `resolved_token_spans`
+(`src/ui/sidebar.rs:1003`) is **not** reused — it is bound to sidebar
+`ResolvedTokenKind` semantics with fixed-width special cases and round-robin
+width distribution, and exposing it would couple the Jobs protocol to the
+Agents/Spaces token system.
 
-## Rendering and layout
+## Notifications
 
-At the default sidebar width of 26 columns (`default_sidebar_width: 26`,
-`src/app/state.rs:1866`; bounds 18–36, drag-resizable) about 24 columns are
-usable. The layout is a fill column for the directory plus two fixed
-right-aligned columns:
+`AppState.toast` is a single `Option<ToastNotification>` slot
+(`src/app/state.rs:1484`) and `ToastKind` has three variants, none general.
+Provider notifications go through a bounded FIFO (cap 8, oldest dropped) drained
+into that slot as it frees. Deduplication is by `notify[].id` against a
+last-seen set, so a provider that keeps reporting an event does not re-toast.
+Levels map onto the existing kinds; a new kind is added only if none fits.
 
-```
-┌────────────────────────┐
-│ SPACES                 │
-│ ▸ phd_research         │
-├────────────────────────┤
-│ AGENTS                 │
-│⠹ ✳ SETUP CONFIG · t6   │
-│  working · herdr-jobs  │
-├────────────────────────┤
-│ ▸ JOBS   2R  1Q  1✓    │   ← collapsed default
-└────────────────────────┘
-```
+Desktop notifications are not used: herdr's system path shells out to
+`notify-send` gated on `$DISPLAY`/`$WAYLAND_DISPLAY`, a silent no-op over SSH.
 
-Expanded:
+## Persistence
 
-```
-│ ▼ JOBS      [live|HIST]│
-│ ▼ Running (2)          │
-│ ued          4N 1:23:45│
-│ xct_xct     16N 0:41:02│
-│ ▼ Queued (1)           │
-│ scf_moire    8N 6:00:00│
-│ ▼ Done (1)             │
-│ tmd_conv     2N      ✓ │
-```
-
-History mode, same box:
-
-```
-│ ▼ JOBS      [live|HIST]│
-│ tmd_conv     2N   ✓ 12m│
-│ xct_xct     16N   ✗ 2h │
-│ relax_bp     1N  TO 5h │
-```
-
-### The layout carve
-
-The existing split functions are hardcoded two-way:
-
-- `sidebar_section_heights(total_h, split_ratio) -> (u16, u16)` — `src/ui/sidebar.rs:42`
-- `expanded_sidebar_sections(area, split_ratio) -> (Rect, Rect)` — `src/ui/sidebar.rs:59`
-- `collapsed_sidebar_sections(area) -> (Rect, Option<u16>, Rect)` — `src/ui/sidebar.rs:728`
-
-Rather than generalizing these to N sections — which would touch every call
-site that destructures their return tuples — `render_sidebar` carves the list
-section's rect off the bottom of the content area **first**, then passes the
-shrunk remainder into the existing functions with their signatures unchanged.
-The input dispatcher in `src/app/input/sidebar.rs` derives its hit-test rect
-from the same helper so the two cannot drift.
-
-Note the collapsed path returns a **3-tuple**, not a pair, and needs its own
-carve; do not assume the two paths are symmetric.
-
-Reuse rather than reimplement:
-
-- `resolved_token_spans` (`src/ui/sidebar.rs:1003`) for cell truncation. It is
-  currently private to the module; widen to `pub(crate)` or keep the list
-  renderer in the same module.
-- `render_scrollbar` (`src/ui/scrollbar.rs:135`) for overflow past
-  `max_visible_rows`.
-- The workspace-group chevron/collapse code (`src/ui/sidebar.rs:1280-1379`) for
-  the section header and per-group headers.
-
-## Polling
-
-The poller is **server-side**. `ClientState` (`src/client/mod.rs`) is a blit
-decoder and host-terminal quirk state machine with no application state;
-`HeadlessServer` owns the single `app::App` (`src/server/headless.rs:4709`,
-`:4816`, `:4962`). Job rows are server-owned, TUI-only-consumed state — the same
-tier as the existing git-status cache — so they extend the internal `AppEvent`
-channel and add no public API surface.
-
-`src/app/jobs_refresh.rs` mirrors `src/app/git_refresh.rs`
-(`start_git_status_refresh_if_due`, `git_refresh.rs:36`): a `next_list_poll:
-Option<Instant>` deadline plus an in-flight guard, spawning a thread that runs
-the configured command and sends `AppEvent::ListSectionPolled` on completion.
-
-**Both event loops must be wired.** `App::run` (`src/app/runtime.rs`) and
-`HeadlessServer::run` (`src/server/headless.rs`) are independently implemented,
-each with its own deadline builder and scheduled-task handler. Headless is the
-default launch path; the monolithic `App` loop is used only in `--no-session`
-and test mode. Wiring only one ships a timer that never fires in normal use.
-
-Mutating state does not itself trigger a repaint. The event handler in
-`src/app/api.rs` must call `render_dirty.request_generic()` and
-`render_notify.notify_one()` explicitly.
-
-## Actions
-
-**Cancel** reuses the existing confirmation machinery. Each confirmation type in
-this codebase is its own `Mode` variant plus state plus render function — there
-is no generic confirm-with-payload. Add `Mode::ConfirmListAction` alongside
-`Mode::ConfirmRemoveWorktree` (`src/app/state.rs:831`, dispatched at
-`src/ui.rs:456`, handled at `src/app/mod.rs:1823`), carrying the action ID and
-row ID. Confirmation is a single-key y/n, matching `CONFIRM_CLOSE_ACTIONS`;
-typed confirmation is reserved for genuinely destructive operations and scancel
-does not clear that bar.
-
-On accept, the command runs in a thread via the non-interactive process helper,
-then sets `next_list_poll = Some(Instant::now())` for an immediate refresh and
-raises an in-TUI toast with the result.
-
-**Tail-log** reuses `spawn_overlay_argv_command`
-(`src/app/input/navigate.rs:1045`) — the same path `$EDITOR`-on-scrollback
-already uses — with `cwd` set to the row's `dir` var. No new pane machinery.
-
-**Mode toggle** clicking `[live|HIST]` in the header cycles `modes` and triggers
-an immediate re-poll with the new `{mode}` substitution.
+Session snapshots already persist sidebar width, split ratio and collapsed
+Spaces state (`src/persist/snapshot.rs:14`, `:251`). Add `jobs_collapsed` and
+`jobs_mode`, both `#[serde(default)]` so existing snapshots load unchanged.
+Collapse state persisting is the point — the section is collapsed by default, so
+expanding must be a one-time act.
 
 ## SLURM provider behaviour
-
-Live mode:
 
 ```
 squeue -u $USER -h -o '%i|%j|%t|%P|%q|%D|%M|%L|%l|%S|%r|%Z|%o|%e'
 ```
 
-Measured at ~35 ms on Perlmutter, which is comfortable at a 10-second cadence.
-Field mapping: `%i` job ID, `%j` name, `%t` state, `%P` partition, `%q` QOS,
-`%D` node count, `%M` elapsed, `%L` time left, `%l` time limit, `%S` start time,
-`%r` pending reason, `%Z` work directory, `%o`/`%e` stdout/stderr paths.
+Measured ~35 ms. `%i` id, `%j` name, `%t` state, `%P` partition, `%q` QOS,
+`%D` nodes, `%M` elapsed, `%L` time left, `%l` limit, `%S` start, `%r` reason,
+`%Z` workdir, `%o`/`%e` stdout/stderr paths.
 
-Grouping is by `%t`: `R` → Running (display `%L`), `PD` → Queued (display `%l`).
+Grouping by `%t`: `R` → Running (show `%L`), `PD` → Queued (show `%l`).
 
-Time fields are pre-formatted strings, not seconds. They gain a leading `D-`
-once past 24 hours and can be the literal `UNLIMITED` or `N/A`. The parser must
-handle all three rather than assuming `HH:MM:SS`.
+Time fields are pre-formatted strings. They gain a `D-` prefix past 24 hours and
+can be `UNLIMITED` or `N/A`. Do not assume `HH:MM:SS`.
 
-The directory label is the last one or two components of `%Z`. No `~`-collapse
-helper for subpaths exists in the codebase — only exact-`$HOME` match and
-basename extraction — so the provider does this itself.
+The directory label is the last one or two components of `%Z`; no `~`-collapse
+helper exists in the codebase for subpaths, so the provider does it.
 
-### Linger and notifications
+`%o`/`%e` are unresolved templates (`slurm-%j.out`) for pending jobs, so `tail`
+is omitted from `actions` on pending rows and the menu item is hidden.
 
-Each poll's job IDs are compared against the previous poll's, persisted in
-`${TMPDIR:-/tmp}/herdr-jobs-$USER.json`. Node-local by design: `$HOME` is shared
-across NERSC login nodes and this is per-node runtime state.
+### Linger, history, notifications
 
-IDs that disappeared get one `sacct -j <id> --format=State,ExitCode -n -P`
-lookup and move into a Done group with a style and glyph by final state —
-`COMPLETED` → green ✓, `FAILED` → red ✗, `TIMEOUT` → `TO`, `CANCELLED` → `CA` —
-plus a `notify` entry. They age out after 10 minutes.
+Each poll's ids are compared against the previous poll's. Ids that disappeared
+get one `sacct -j <id> --format=State,ExitCode -n -P` lookup and enter a Done
+group: `COMPLETED` → `ok` ✓, `FAILED` → `fail` ✗, `TIMEOUT` → `warn` TO,
+`CANCELLED` → `muted` CA, each with a `notify` entry keyed `done-<id>`. They age
+out at 10 minutes. sacct runs only on transitions, never on the steady poll.
 
-sacct runs only on transitions and in history mode, never on the steady-state
-poll. It is roughly 5× the cost of squeue and expands into per-step rows.
-
-History mode returns the last 10 finished jobs from sacct with the same row
+History mode returns the last 10 finished jobs from sacct in the same row
 schema, so the renderer needs no special case.
+
+State file: a private per-user directory (`0700`), not a predictable shared
+`/tmp` path — otherwise concurrent herdr instances race and the filename is
+symlink-attackable. Written atomically (temp file plus rename) under an flock.
+Node-local, since `$HOME` is shared across NERSC login nodes and this is
+per-node runtime state.
 
 ## Testing
 
-- `parse_provider_output` — a pure function over a JSON string. Covers valid
-  payloads, unknown fields, missing groups, wrong version, and malformed JSON.
-  No cluster required.
-- Config defaults, mirroring the existing
-  `defaults_match_the_compact_agent_and_existing_space_layouts` test.
-- The layout carve: given a sidebar rect and a jobs height, the remainder passed
-  to `expanded_sidebar_sections` matches expectation, and the carve degrades
-  sanely at tiny heights (compare `expanded_sidebar_sections_handle_tiny_heights`,
-  `src/ui/sidebar.rs:2506`).
-- Hit-testing: a click at a given row maps to the expected row ID, and the
-  render rect and hit-test rect agree.
-- Provider script: squeue-output parsing and linger-expiry logic against
-  recorded fixtures.
+- `parse_provider_output` — pure function over a JSON string. Valid payloads,
+  version mismatch, unknown fields, duplicate ids, one bad row among good ones,
+  every cap boundary, control characters, empty-but-valid.
+- Substitution — each token kind, `{{` escaping, unresolved token refusal,
+  `vars` shadowing refusal, argv[0] substitution refusal.
+- Action validation — job-id regex accepts plain/array/het ids and rejects `-A`;
+  non-absolute and non-existent `{log}` rejected.
+- `SidebarLayout` — expanded and collapsed carves independently; every row of
+  the degradation table; the toggle row always survives; tiny heights (compare
+  `expanded_sidebar_sections_handle_tiny_heights`, `src/ui/sidebar.rs:2506`).
+- **Render/hit-test agreement** — for a generated set of sidebar sizes, every
+  rect the renderer draws a row into is the rect the hit-tester maps that row
+  from. This is the regression test for the class of bug rev 1 would have
+  shipped.
+- Divider drag — dragging to row N yields a ratio that renders the divider back
+  at row N, with Jobs allocated.
+- Regression — with `enabled = false`, all pre-existing sidebar tests pass
+  unchanged.
+- Poller — timeout kills the process group; a panicking worker still clears
+  in-flight; a stale-generation result is discarded; oversized output marks
+  stale without clearing rows.
+- Provider script — squeue parsing and linger expiry against recorded fixtures.
 
-## Constraints and risks
+## Build
+
+Two prerequisites, both resolved; `build-env.sh` at the repo root must be
+sourced for every build.
+
+1. No system rustc/cargo. `module load rust/stable` resolves to 1.96.1, matching
+   `rust-toolchain.toml`, but the module's `RUSTUP_HOME` is read-only shared
+   software and errors on use. Redirect `RUSTUP_HOME`, `CARGO_HOME` and
+   `CARGO_TARGET_DIR` to pscratch; `$HOME` is at 73% of 40 GiB.
+2. **`build.rs` requires zig.** herdr vendors libghostty-vt and `build.rs:63-80`
+   shells out to `zig build`, panicking with a bare `NotFound` if absent.
+   `vendor/libghostty-vt/build.zig.zon` requires >= 0.15.2 and there is no NERSC
+   module. Pinned 0.15.2 to `$PSCRATCH/tools`, with `ZIG_GLOBAL_CACHE_DIR` and
+   `ZIG_LOCAL_CACHE_DIR` redirected off `$HOME`. Pinned rather than tracking
+   latest because zig breaks builds across minor versions.
+
+Verified: stock v0.8.0 builds clean in 2m26s cold, producing `herdr 0.8.0`.
+
+## Constraints
 
 **Upstreaming is gated.** `CONTRIBUTING.md` auto-closes unsolicited
-implementation PRs; only accounts on an `APPROVED_CONTRIBUTORS` list may submit
-them, and a change this size needs a maintainer-approved Discussion first. Plan
-the fork as permanent. If upstreaming is later attempted, the generic list
-section is the submittable artifact — the SLURM provider is not.
-
-**Rebase surface.** The patch concentrates in `src/ui/sidebar.rs`,
-`src/config/sidebar.rs`, `src/app/mod.rs`, and `src/server/headless.rs` — among
-the most frequently changed files in the project. Keep the carve helper and the
-list renderer in new files where possible to reduce conflict area.
+implementation PRs; only `APPROVED_CONTRIBUTORS` accounts may submit, after a
+maintainer-approved Discussion. Plan the fork as permanent. If upstreaming is
+attempted later, the generic list section is the submittable artifact; the SLURM
+provider is not.
 
 **`herdr update` overwrites by path.** It atomically replaces whatever sits at
 `env::current_exe()`. Replacing `~/.local/bin/herdr` requires disabling the
-update check, and the stock binary should be preserved as `herdr-stock` first —
-it is the only fallback if a rebase breaks mid-week.
+update check, and the stock binary must be preserved as `herdr-stock` first — it
+is the only fallback if a rebase breaks.
 
-**Toolchain.** Two prerequisites, both resolved; see `build-env.sh` at the repo
-root, which every build must source.
+**Rebase surface.** Concentrated in `src/ui/sidebar.rs`,
+`src/app/input/sidebar.rs`, `src/app/input/mouse.rs`, `src/ui.rs`,
+`src/config/sidebar.rs` and `src/server/headless.rs`. Keep new code in new files
+where possible; the `SidebarLayout` refactor is the unavoidable exception.
 
-1. No rustc/cargo on this machine. `module load rust/stable` is rustup-based and
-   resolves to 1.96.1, matching `rust-toolchain.toml`, but the module's own
-   `RUSTUP_HOME` points at read-only shared software and errors on use.
-   Redirect `RUSTUP_HOME`, `CARGO_HOME`, and `CARGO_TARGET_DIR` to pscratch.
-   `$HOME` is at 73% of a 40 GiB quota and must not hold build artifacts.
-2. **`build.rs` requires zig.** herdr vendors libghostty-vt and `build.rs:63-80`
-   shells out to `zig build -Demit-lib-vt`, panicking with a bare `NotFound` if
-   zig is absent. `vendor/libghostty-vt/build.zig.zon` declares
-   `minimum_zig_version = "0.15.2"`. There is no NERSC zig module. Installed
-   0.15.2 from the official tarball to `$PSCRATCH/tools/zig-0.15.2` and exported
-   `ZIG` plus `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` (which otherwise
-   default under `$HOME`). Pinned to 0.15.2 rather than 0.16/0.17 because zig
-   breaks builds across minor versions.
+## Out of scope for v1
 
-`build.rs` also honours `LIBGHOSTTY_VT_ZIG_SYSTEM_DIR` for a prebuilt
-libghostty-vt, which would avoid zig entirely — not pursued, since a pinned zig
-tarball is simpler than sourcing a matching prebuilt library.
-
-**System notifications do not work here.** Herdr's system toast path shells out
-to `notify-send` gated on `$DISPLAY`/`$WAYLAND_DISPLAY`, a silent no-op on an
-SSH login-node session. All notifications use the in-TUI delivery path.
-
-**Config errors are coarse.** No struct in the `SidebarConfig` family uses
-`deny_unknown_fields`, and a deserialize error anywhere in `config.toml` falls
-back to a full default config. A malformed `[ui.sidebar.list]` table silently
-resets unrelated settings. Pre-existing, but a new section widens the exposure.
-
-**Tail-log on pending jobs.** `%o`/`%e` return unresolved templates such as
-`slurm-%j.out` before a job starts. The provider omits `tail` from `actions` for
-pending rows, rendering it disabled. Resolving them would need
-`scontrol show job -d <id>`, deferred.
-
-## Explicitly out of scope for v1
-
-- Keyboard navigation. No focus concept exists for a sidebar list not backed by
-  a pane — Agents and Spaces selection both piggyback on real pane/workspace
-  focus. Inventing a focus zone is the highest-variance part of the estimate and
-  is deferred to v2.
+- Keyboard navigation of the Jobs list. No focus concept exists for a sidebar
+  list not backed by a pane; Spaces and Agents both piggyback on real focus.
+  The context menu does have keyboard support once open.
 - Multiple named list sections.
+- Draggable Jobs height (fixed cap plus scrollbar instead).
+- Top placement.
 - Any cluster other than Perlmutter.
-- Job submission from the sidebar.
-
-## Effort
-
-Roughly 900–1400 lines of Rust across ~15 files, plus ~250 lines of Python.
-Every subsystem has a close template in-tree; the layout carve and the hit-test
-alignment are the parts with no precedent to copy.
+- Job submission.
