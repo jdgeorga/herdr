@@ -20,18 +20,18 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 
 impl AppState {
     /// The sidebar geometry computed by `compute_view` (design doc: "Layout —
-    /// one source of truth"). Prefers the cached `ViewState` copy, matching
-    /// the same read-cache-else-recompute pattern `workspace_at_row` already
-    /// uses for `workspace_card_areas`: a handful of pre-existing tests set
-    /// `view.sidebar_rect` directly without calling `compute_view`, so a
-    /// default (never-populated) cache falls back to a fresh, equally correct
-    /// computation instead of returning stale/empty geometry.
+    /// one source of truth"). Reads the cached `ViewState` copy only --
+    /// **never** recomputes. A prior version fell back to a fresh
+    /// `compute_sidebar_layout` call whenever the cache equaled
+    /// `SidebarLayout::default()`, which made this a second source of truth:
+    /// input handling ran against freshly-recomputed geometry that could
+    /// reflect state mutated *after* the last render, while the screen still
+    /// showed whatever `compute_view` last produced. Tests that construct
+    /// `AppState` by hand instead of calling `compute_view` must populate
+    /// `view.sidebar_layout` themselves --
+    /// `AppState::recompute_sidebar_layout_for_test` (test-only).
     pub(crate) fn sidebar_layout(&self) -> crate::app::state::SidebarLayout {
-        if self.view.sidebar_layout != crate::app::state::SidebarLayout::default() {
-            self.view.sidebar_layout.clone()
-        } else {
-            crate::ui::compute_sidebar_layout(self, self.view.sidebar_rect)
-        }
+        self.view.sidebar_layout.clone()
     }
 
     /// Whether `(col, row)` is inside the Jobs rect at all (design doc's
@@ -59,17 +59,41 @@ impl AppState {
             .cloned()
     }
 
-    /// Whether the job with `row_id` currently lists `tail` among its
-    /// actions (design doc: pending jobs omit `tail` because `%o`/`%e` are
-    /// still unresolved templates), read straight off the last poll's parsed
-    /// rows rather than threaded through `JobRowHit`.
-    pub(super) fn jobs_row_can_tail(&self, row_id: &str) -> bool {
-        self.jobs
+    /// Whether the job with `row_id` currently authorizes `action_id`
+    /// (design doc: "Each provider row carries an `actions: [...]` list.
+    /// That list is AUTHORIZATION"). Both the row *and* the configured
+    /// `ui.sidebar.list.actions` must agree the action exists -- a row can
+    /// only narrow what config allows, never widen it. Read straight off the
+    /// last poll's parsed rows rather than threaded through `JobRowHit`, so a
+    /// context menu built from a stale hit still reflects the current row.
+    pub(super) fn jobs_row_permits_action(&self, row_id: &str, action_id: &str) -> bool {
+        let row_permits = self
+            .jobs
             .groups
             .iter()
             .flat_map(|group| &group.rows)
             .find(|row| row.id == row_id)
-            .is_some_and(|row| row.actions.iter().any(|action| action == "tail"))
+            .is_some_and(|row| row.actions.iter().any(|action| action == action_id));
+        row_permits
+            && self
+                .sidebar_list
+                .actions
+                .iter()
+                .any(|action| action.id == action_id)
+    }
+
+    /// Whether the job with `row_id` currently lists `tail` among its
+    /// authorized actions (design doc: pending jobs omit `tail` because
+    /// `%o`/`%e` are still unresolved templates).
+    pub(super) fn jobs_row_can_tail(&self, row_id: &str) -> bool {
+        self.jobs_row_permits_action(row_id, "tail")
+    }
+
+    /// Whether the job with `row_id` currently lists `cancel` among its
+    /// authorized actions (design doc: rows for Done/history jobs emit
+    /// `actions: []` "precisely so they cannot be cancelled").
+    pub(super) fn jobs_row_can_cancel(&self, row_id: &str) -> bool {
+        self.jobs_row_permits_action(row_id, "cancel")
     }
 
     /// Section-header chevron click (design doc mouse contract: "collapse /
@@ -1229,6 +1253,7 @@ mod tests {
         app.state.sidebar_collapsed = true;
         app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
         app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+        app.state.recompute_sidebar_layout_for_test();
 
         let (_, _, detail_area) =
             crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
@@ -1263,6 +1288,7 @@ mod tests {
         app.state.agent_panel_sort = AgentPanelSort::Priority;
         app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
         app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+        app.state.recompute_sidebar_layout_for_test();
 
         let set_state = |app: &mut crate::app::App, ws_idx: usize, pane_id, state| {
             let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
@@ -1297,6 +1323,7 @@ mod tests {
         app.state.sidebar_collapsed = true;
         app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
         app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+        app.state.recompute_sidebar_layout_for_test();
 
         let toggle = crate::ui::collapsed_sidebar_toggle_rect(app.state.view.sidebar_rect);
         app.handle_mouse(mouse(
@@ -1315,6 +1342,7 @@ mod tests {
         app.state.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
         app.state.view.sidebar_rect = Rect::new(0, 0, 0, 20);
         app.state.view.terminal_area = Rect::new(0, 0, 80, 20);
+        app.state.recompute_sidebar_layout_for_test();
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 19));
 
@@ -1327,6 +1355,7 @@ mod tests {
         app.state.sidebar_collapsed = false;
         app.state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
         app.state.view.terminal_area = Rect::new(26, 0, 80, 20);
+        app.state.recompute_sidebar_layout_for_test();
 
         let toggle = crate::ui::expanded_sidebar_toggle_rect(app.state.view.sidebar_rect);
         app.handle_mouse(mouse(

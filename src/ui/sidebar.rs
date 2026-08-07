@@ -12,7 +12,10 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
-use crate::app::state::{AgentPanelSort, JobRowHit, JobsHeaderHits, JobsSectionState, Palette, SidebarLayout};
+use crate::app::state::{
+    AgentPanelSort, JobRowHit, JobRowHitKind, JobsHeaderHits, JobsSectionState, Palette,
+    SidebarLayout,
+};
 use crate::app::{AppState, Mode};
 use crate::config::{ColumnAlign, ColumnSpec, ColumnWidth, ListSectionConfig};
 use crate::detect::AgentState;
@@ -669,6 +672,22 @@ pub(crate) fn compute_workspace_list_areas(
 ) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
     let ws_area = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
         .spaces;
+    compute_workspace_list_areas_for_spaces(app, ws_area)
+}
+
+/// Same as [`compute_workspace_list_areas`], but takes the Spaces rect
+/// directly instead of re-deriving it from `area` via a fresh
+/// `compute_expanded_sidebar_layout` call. `compute_view_internal`
+/// (`ui.rs`) already has that rect on the `SidebarLayout` it just computed
+/// (`sidebar_layout.spaces`) -- calling this instead of
+/// `compute_workspace_card_areas` avoids re-carving the whole sidebar a
+/// second time per frame (design doc: "Layout — one source of truth").
+/// `compute_workspace_list_areas` itself is kept re-deriving `ws_area` for
+/// the pre-existing tests that call it directly with a raw sidebar `area`.
+pub(crate) fn compute_workspace_list_areas_for_spaces(
+    app: &AppState,
+    ws_area: Rect,
+) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
     }
@@ -718,6 +737,14 @@ pub(crate) fn compute_workspace_card_areas(
     area: Rect,
 ) -> Vec<crate::app::state::WorkspaceCardArea> {
     compute_workspace_list_areas(app, area).0
+}
+
+/// See [`compute_workspace_list_areas_for_spaces`].
+pub(crate) fn compute_workspace_card_areas_from_layout(
+    app: &AppState,
+    ws_area: Rect,
+) -> Vec<crate::app::state::WorkspaceCardArea> {
+    compute_workspace_list_areas_for_spaces(app, ws_area).0
 }
 
 pub(crate) fn workspace_group_chevron_rect(card: &crate::app::state::WorkspaceCardArea) -> Rect {
@@ -806,16 +833,27 @@ fn jobs_section_want(app: &AppState) -> JobsSectionWant {
     }
 }
 
-/// Whether the poller has ever produced a result worth showing, distinct from
-/// a valid successful poll that legitimately found zero jobs (which does set
-/// `title`/`summary`, per the provider protocol's "a payload with no groups
-/// and no notifications is a valid, empty result"). The list-section poller
-/// itself is not wired into `AppState` yet, so `ListSectionConfig::enabled`
-/// defaulting to `true` would otherwise put a permanently-empty "JOBS" header
-/// into every sidebar today; gating on this too keeps that dormant until a
-/// poller (or a test) actually populates `AppState::jobs`.
+/// Whether the poller has ever produced a result -- success OR failure --
+/// worth showing, distinct from a valid successful poll that legitimately
+/// found zero jobs (which does set `title`/`summary`, per the provider
+/// protocol's "a payload with no groups and no notifications is a valid,
+/// empty result"). The list-section poller itself is not wired into
+/// `AppState` yet, so `ListSectionConfig::enabled` defaulting to `true`
+/// would otherwise put a permanently-empty "JOBS" header into every sidebar
+/// today; gating on this too keeps that dormant until a poller (or a test)
+/// actually populates `AppState::jobs`.
+///
+/// `is_stale`/`last_error` count too (design doc finding: "a first-ever poll
+/// failure is invisible"): a provider that's broken from the very first poll
+/// never sets `title`/`summary`/`groups`, so without this the section stays
+/// hidden forever with no header and no clue why, instead of showing the
+/// default "JOBS" header with a stale/error indicator (`jobs_header_right_text`).
 fn jobs_has_content(state: &JobsSectionState) -> bool {
-    state.title.is_some() || state.summary.is_some() || !state.groups.is_empty()
+    state.title.is_some()
+        || state.summary.is_some()
+        || !state.groups.is_empty()
+        || state.is_stale
+        || state.last_error.is_some()
 }
 
 /// One line the Jobs section body draws, in top-to-bottom order, independent
@@ -882,22 +920,44 @@ impl JobsAllocation {
 
 /// Implements the design doc's degradation table. `content_height` is the
 /// sidebar's content height *before* the toggle row is reserved (border
-/// already excluded, since the border only trims width) -- this is the `H`
-/// the table's last row ("`H < 7` => hidden entirely") gates on. The other
-/// three rows key off usable height *after* the toggle row, i.e.
-/// `content_height - 1`.
+/// already excluded, since the border only trims width). `min_remainder` is
+/// how many rows Spaces+Agents need at minimum once Jobs has taken its cut.
 ///
-/// Below `content_height == 7` (so `content_height - 1 == 6`), giving Jobs
-/// even its minimum one collapsed row would leave only 5 rows for
-/// Spaces+Agents, one short of the stated 3-rows-each floor. The design doc
-/// states both "Jobs never starves Spaces/Agents below 3 rows each" and this
-/// exact one-row degradation row; they are not simultaneously satisfiable at
-/// `content_height == 7`. This implements the table literally (row 3 fires,
-/// minimum floor loses by one row at that single height) since the table is
-/// the piece the design doc asks to be tested row-by-row; see the
-/// `jobs_allocation` tests for the boundary.
-fn jobs_allocation(want: JobsSectionWant, content_height: u16) -> JobsAllocation {
-    if !want.enabled || content_height < 7 {
+/// The design doc's own "`H < 7` => hidden entirely" row uses the *same* `H`
+/// as the other three rows: usable height *after* the toggle row is
+/// reserved (`content_height - 1`), not `content_height` itself (finding:
+/// "apply the '<7' hide test to POST-toggle height") -- a sidebar with
+/// `content_height == 7` has only 6 usable rows once the toggle is
+/// reserved, which must hide Jobs entirely rather than squeeze it into a
+/// single collapsed-header row and leave Spaces/Agents below their 3-row
+/// floor.
+///
+/// `min_remainder` is 6 (3 rows each) for the expanded carve, but the
+/// collapsed carve needs its own, higher floor: `collapsed_sidebar_sections`
+/// needs a 7-row remainder to show *both* the workspace glance and the
+/// agent detail list at all (below that it collapses to one undivided
+/// block, dropping Agents entirely) -- passing it expanded's floor of 6
+/// leaves it exactly one row short at some heights, which is the boundary
+/// this function's `min_remainder` parameter exists to give the collapsed
+/// carve its own answer to, rather than sharing expanded's (design doc:
+/// "Collapsed mode is asymmetric... write and test the two carves
+/// separately").
+///
+/// At the single height where `usable == min_remainder` exactly, giving
+/// Jobs even its minimum one collapsed row leaves the remainder one row
+/// short of `min_remainder`. The design doc states both "Jobs never starves
+/// Spaces/Agents below their floor" and this exact one-row degradation row;
+/// they are not simultaneously satisfiable at that one height. This
+/// implements the table literally (the one-row row fires, the floor loses
+/// by one row at that single height) since the table is the piece the
+/// design doc asks to be tested row-by-row; see the `jobs_allocation`
+/// tests for the boundary.
+fn jobs_allocation_with_floor(
+    want: JobsSectionWant,
+    content_height: u16,
+    min_remainder: u16,
+) -> JobsAllocation {
+    if !want.enabled {
         return JobsAllocation::NONE;
     }
     let wanted = want.content_rows.min(want.max_visible_rows);
@@ -905,15 +965,18 @@ fn jobs_allocation(want: JobsSectionWant, content_height: u16) -> JobsAllocation
         return JobsAllocation::NONE;
     }
 
-    let usable = content_height - 1; // after reserving the toggle row
-    if usable >= wanted.saturating_add(6) {
+    let usable = content_height.saturating_sub(1); // after reserving the toggle row
+    if usable < 7 {
+        return JobsAllocation::NONE;
+    }
+    if usable >= wanted.saturating_add(min_remainder) {
         JobsAllocation {
             rows: wanted,
             collapsed_only: false,
         }
-    } else if usable >= 7 {
+    } else if usable > min_remainder {
         JobsAllocation {
-            rows: usable - 6,
+            rows: usable - min_remainder,
             collapsed_only: false,
         }
     } else {
@@ -922,6 +985,16 @@ fn jobs_allocation(want: JobsSectionWant, content_height: u16) -> JobsAllocation
             collapsed_only: true,
         }
     }
+}
+
+fn jobs_allocation(want: JobsSectionWant, content_height: u16) -> JobsAllocation {
+    jobs_allocation_with_floor(want, content_height, 6)
+}
+
+/// See [`jobs_allocation_with_floor`]'s doc comment for why the collapsed
+/// carve needs its own, higher floor (7, not expanded's 6).
+fn jobs_allocation_collapsed(want: JobsSectionWant, content_height: u16) -> JobsAllocation {
+    jobs_allocation_with_floor(want, content_height, 7)
 }
 
 /// Carves `rows` off the bottom of `area` (Jobs sits above the toggle row,
@@ -1026,7 +1099,7 @@ pub(crate) fn compute_collapsed_sidebar_layout(area: Rect, jobs: JobsSectionWant
     let toggle = collapsed_sidebar_toggle_rect(area);
     let content_width = area.width.saturating_sub(1);
     let content_height = if content_width == 0 { 0 } else { area.height };
-    let allocation = jobs_allocation(jobs, content_height);
+    let allocation = jobs_allocation_collapsed(jobs, content_height);
 
     if allocation.rows == 0 {
         let (spaces, section_divider_y, agents) = collapsed_sidebar_sections(area);
@@ -1076,11 +1149,27 @@ pub(crate) fn compute_collapsed_sidebar_layout(area: Rect, jobs: JobsSectionWant
 /// `(app, area)`, so every caller agrees regardless of which path calls it.
 pub(crate) fn compute_sidebar_layout(app: &AppState, area: Rect) -> SidebarLayout {
     let jobs = jobs_section_want(app);
-    let mut layout = if app.sidebar_collapsed {
+    let layout = if app.sidebar_collapsed {
         compute_collapsed_sidebar_layout(area, jobs)
     } else {
         compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs)
     };
+    populate_jobs_row_geometry(app, layout)
+}
+
+/// Fills in `jobs_rows`/`jobs_scrollbar`/`jobs_header_hits` on a `SidebarLayout`
+/// whose `jobs` rect has already been carved -- the one place that calls
+/// `jobs_content_layout`. Both `compute_expanded_sidebar_layout` and
+/// `compute_collapsed_sidebar_layout` deliberately leave these fields at
+/// their defaults (`Vec::new()`/`None`/`JobsHeaderHits::default()`): they're
+/// pure carve functions that don't take `&AppState`, only the pieces of it
+/// (`split_ratio`, `JobsSectionWant`) the design doc's "Allocation order"
+/// needs. `compute_sidebar_layout` is the only production caller; the
+/// `_for_test` helpers below exist because a handful of tests need this same
+/// population step applied to a layout forced into a specific carve rather
+/// than the one `app.sidebar_collapsed` would pick (design doc: "If a test
+/// needs synthetic geometry, give it an explicitly named test-only helper").
+fn populate_jobs_row_geometry(app: &AppState, mut layout: SidebarLayout) -> SidebarLayout {
     if layout.jobs != Rect::default() {
         let (jobs_rows, jobs_scrollbar, jobs_header_hits, _) =
             jobs_content_layout(&app.jobs, &app.sidebar_list, layout.jobs);
@@ -1089,6 +1178,25 @@ pub(crate) fn compute_sidebar_layout(app: &AppState, area: Rect) -> SidebarLayou
         layout.jobs_header_hits = jobs_header_hits;
     }
     layout
+}
+
+/// Test-only: `SidebarLayout` for `render_sidebar`'s expanded carve,
+/// regardless of `app.sidebar_collapsed` -- mirrors `render_sidebar`'s own
+/// "always the expanded carve" contract for tests that call it directly
+/// without setting that flag.
+#[cfg(test)]
+fn compute_expanded_sidebar_layout_for_test(app: &AppState, area: Rect) -> SidebarLayout {
+    let layout =
+        compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app));
+    populate_jobs_row_geometry(app, layout)
+}
+
+/// Test-only counterpart of [`compute_expanded_sidebar_layout_for_test`] for
+/// `render_sidebar_collapsed`.
+#[cfg(test)]
+fn compute_collapsed_sidebar_layout_for_test(app: &AppState, area: Rect) -> SidebarLayout {
+    let layout = compute_collapsed_sidebar_layout(area, jobs_section_want(app));
+    populate_jobs_row_geometry(app, layout)
 }
 
 /// Clamps `scroll` against `total_rows`/`body_height` and derives the
@@ -1235,19 +1343,25 @@ fn jobs_content_layout(
     let mut rows = Vec::new();
     for (offset, plan_row) in plan.iter().skip(scroll).take(metrics.viewport_rows).enumerate() {
         let rect = Rect::new(body_rect.x, body_rect.y + offset as u16, content_width, 1);
-        // Group headers use their own id as both `row_id` and `group_id` --
-        // the convention `render_jobs_section` and (eventually) the mouse
-        // handler use to tell a group header hit apart from a job row hit,
-        // since job row ids are guaranteed unique across the whole payload
-        // and so never legitimately collide with a group id here.
-        let (row_id, group_id) = match plan_row {
-            JobsPlanRow::GroupHeader { group } => (group.id.clone(), group.id.clone()),
-            JobsPlanRow::Row { group_id, row } => (row.id.clone(), (*group_id).to_string()),
+        // Group headers use their own id as both `row_id` and `group_id`,
+        // but `kind` -- not that id equality -- is what tells a group header
+        // hit apart from a job row hit: nothing in the provider protocol
+        // stops a row's `id` from coincidentally colliding with a group's
+        // `id` (design doc finding: "group and row IDs share a namespace
+        // used as a type tag").
+        let (row_id, group_id, kind) = match plan_row {
+            JobsPlanRow::GroupHeader { group } => {
+                (group.id.clone(), group.id.clone(), JobRowHitKind::Group)
+            }
+            JobsPlanRow::Row { group_id, row } => {
+                (row.id.clone(), (*group_id).to_string(), JobRowHitKind::Row)
+            }
         };
         rows.push(JobRowHit {
             rect,
             row_id,
             group_id,
+            kind,
         });
     }
 
@@ -1490,24 +1604,42 @@ fn render_jobs_row(
 /// `render_sidebar` for why, and note it is a pure function of
 /// `(app.jobs, app.sidebar_list, jobs_rect)` so it cannot disagree with what
 /// `compute_sidebar_layout` stores for hit-testing.
-fn render_jobs_section(app: &AppState, frame: &mut Frame, jobs_rect: Rect) {
+/// Draws the Jobs section from the already-computed `layout` -- never calls
+/// `jobs_content_layout` itself (design doc: "Layout — one source of truth").
+/// `layout.jobs_rows`/`.jobs_header_hits`/`.jobs_scrollbar` are exactly what
+/// hit-testing reads (`AppState::jobs_row_hit_at` et al., via
+/// `app.view.sidebar_layout`), so the rect this draws a row into and the rect
+/// a click maps that row from are, by construction, the same value -- not two
+/// independent computations that happen to agree. The one thing intentionally
+/// *not* carried on `SidebarLayout` is scroll `ScrollMetrics` (needed only for
+/// the scrollbar thumb's size/position): `jobs_list_scroll_metrics` is itself
+/// already the single source both this and mouse hit-testing call.
+fn render_jobs_section(app: &AppState, frame: &mut Frame, layout: &SidebarLayout) {
+    let jobs_rect = layout.jobs;
     if jobs_rect == Rect::default() {
         return;
     }
     let p = &app.palette;
     let state = &app.jobs;
     let config = &app.sidebar_list;
-    let (rows, scrollbar, header_hits, metrics) = jobs_content_layout(state, config, jobs_rect);
     let collapsed_style = state.collapsed || jobs_rect.height <= 1;
     let header_rect = Rect::new(jobs_rect.x, jobs_rect.y, jobs_rect.width, 1);
 
-    render_jobs_header(frame, &header_hits, header_rect, state, config, collapsed_style, p);
+    render_jobs_header(
+        frame,
+        &layout.jobs_header_hits,
+        header_rect,
+        state,
+        config,
+        collapsed_style,
+        p,
+    );
 
-    for row_hit in &rows {
+    for row_hit in &layout.jobs_rows {
         let Some(group) = state.groups.iter().find(|group| group.id == row_hit.group_id) else {
             continue;
         };
-        if row_hit.row_id == row_hit.group_id {
+        if row_hit.kind == JobRowHitKind::Group {
             let collapsed = state.collapsed_group_ids.contains(&group.id);
             render_jobs_group_header(frame, row_hit.rect, group, collapsed, p);
         } else if let Some(row) = group.rows.iter().find(|row| row.id == row_hit.row_id) {
@@ -1516,13 +1648,19 @@ fn render_jobs_section(app: &AppState, frame: &mut Frame, jobs_rect: Rect) {
         }
     }
 
-    if let Some(track) = scrollbar {
+    if let Some(track) = layout.jobs_scrollbar {
+        let metrics = jobs_list_scroll_metrics(app, jobs_rect);
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
     }
 }
 
 /// Collapsed sidebar: workspace glance on top, compact agent list below.
-pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
+pub(super) fn render_sidebar_collapsed(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    layout: &SidebarLayout,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1545,15 +1683,14 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    // Always the collapsed carve: which render function runs is the caller's
-    // decision (`render_navigation_chrome` branches on `app.sidebar_collapsed`
-    // before choosing between this and `render_sidebar`), not this function's
-    // -- tests draw this directly with `sidebar_collapsed` left at its
-    // default, so reading `app.sidebar_collapsed` here would pick the wrong
-    // carve for them.
-    let layout = compute_collapsed_sidebar_layout(area, jobs_section_want(app));
+    // `layout` is the caller's single computed `SidebarLayout` (design doc:
+    // "Layout — one source of truth") -- this function never recomputes it,
+    // whether the caller is `render_navigation_chrome` (passing
+    // `app.view.sidebar_layout`) or a test (passing a synthetic layout built
+    // with `compute_sidebar_layout`/`compute_collapsed_sidebar_layout`
+    // directly against the same `area`).
     let (ws_area, divider_y, detail_area) = (layout.spaces, layout.section_divider_y, layout.agents);
-    render_jobs_section(app, frame, layout.jobs);
+    render_jobs_section(app, frame, layout);
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, layout.toggle, true, p);
         return;
@@ -1612,12 +1749,28 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         }
     }
 
-    let detail_content_area = Rect::new(
-        detail_area.x,
-        detail_area.y,
-        detail_area.width,
-        detail_area.height.saturating_sub(1),
-    );
+    // The toggle only actually overlaps detail_area's bottom row when it's
+    // drawn as an overlay on top of it -- the pre-Jobs two-way layout's
+    // behavior, still used when Jobs is hidden (`collapsed_sidebar_toggle_rect`
+    // is computed off the *full* sidebar area, sharing detail_area's last
+    // row). Once Jobs is showing, the toggle sits in its own reserved row
+    // below Jobs, entirely outside `detail_area` -- trimming a row there
+    // too would waste an Agents row for no reason (design doc finding:
+    // "rendering removes its last row even though the toggle now sits below
+    // Jobs").
+    let toggle_overlaps_detail = detail_area.height > 0
+        && layout.toggle.y >= detail_area.y
+        && layout.toggle.y < detail_area.y + detail_area.height;
+    let detail_content_area = if toggle_overlaps_detail {
+        Rect::new(
+            detail_area.x,
+            detail_area.y,
+            detail_area.width,
+            detail_area.height.saturating_sub(1),
+        )
+    } else {
+        detail_area
+    };
     if detail_content_area != Rect::default() {
         for (detail_idx, detail) in agent_panel_entries(app).iter().enumerate() {
             let y = detail_content_area.y + detail_idx as u16;
@@ -1755,6 +1908,7 @@ pub(super) fn render_sidebar(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
+    layout: &SidebarLayout,
 ) {
     let p = &app.palette;
     frame
@@ -1774,13 +1928,12 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    // Always the expanded carve -- see the matching comment in
+    // `layout` is the caller's single computed `SidebarLayout` (design doc:
+    // "Layout — one source of truth") -- see the matching comment in
     // `render_sidebar_collapsed`.
-    let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app));
-
     render_workspace_list(app, terminal_runtimes, frame, layout.spaces, is_navigating);
     render_agent_detail(app, terminal_runtimes, frame, layout.agents);
-    render_jobs_section(app, frame, layout.jobs);
+    render_jobs_section(app, frame, layout);
     render_sidebar_toggle(app, frame, layout.toggle, false, p);
 }
 
@@ -2398,8 +2551,9 @@ mod tests {
         let area = Rect::new(0, 0, 26, 20);
 
         let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         expanded
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         assert!(expanded
             .backend()
@@ -2409,8 +2563,9 @@ mod tests {
             .all(|cell| cell.bg == app.palette.sidebar_bg));
 
         let mut collapsed = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         collapsed
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .unwrap();
         assert!(collapsed
             .backend()
@@ -2437,8 +2592,9 @@ mod tests {
 
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -2489,8 +2645,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
 
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -2515,8 +2672,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let first_row = app.view.workspace_card_areas[0].rect.y;
         let second_row = app.view.workspace_card_areas[1].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -2558,8 +2716,9 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         let row = app.view.workspace_card_areas[0].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let h = buffer[(find_symbol_x(buffer, row, 25, "H"), row)].style();
@@ -2660,8 +2819,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let area = Rect::new(0, 0, 18, 20);
         let mut terminal = Terminal::new(TestBackend::new(18, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -2691,8 +2851,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let area = Rect::new(0, 0, 10, 12);
         let mut renderer = Terminal::new(TestBackend::new(10, 12)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         renderer
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -2945,8 +3106,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
 
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .expect("collapsed sidebar should render");
 
         let buffer = terminal.backend().buffer();
@@ -2986,8 +3148,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     ) -> Vec<Vec<ratatui::style::Style>> {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(app, frame, area, &layout))
             .expect("collapsed sidebar should render");
         let buffer = terminal.backend().buffer();
         (0..rows)
@@ -3074,8 +3237,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
 
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .expect("collapsed sidebar should render");
 
         let tenth_row = workspace_area.y + 9;
@@ -3115,8 +3279,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
 
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .expect("collapsed sidebar should render");
 
         let tenth_row = detail_area.y + 9;
@@ -3165,8 +3330,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
 
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .expect("collapsed sidebar should render");
 
         let buffer = terminal.backend().buffer();
@@ -3358,11 +3524,15 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         );
     }
 
+    /// Finding 4: row 3 ("collapsed header only") no longer fires for the
+    /// *expanded* carve at `content_height == 7` -- that height now hides
+    /// per the corrected row 4 ("H < 7", using post-toggle H). Row 3 is
+    /// still reachable, just at the collapsed carve's own boundary
+    /// (`min_remainder == 7`, one higher than expanded's 6): `usable ==
+    /// min_remainder` exactly, i.e. `content_height == 8`.
     #[test]
     fn degradation_table_row_3_collapses_to_one_header_row() {
-        // H - 6 < 1 (but H >= 7, so Jobs isn't fully hidden): one row,
-        // collapsed header only. content_height = 7 => usable = 6.
-        let allocation = jobs_allocation(jobs_want(4, 12), 7);
+        let allocation = jobs_allocation_collapsed(jobs_want(4, 12), 8);
         assert_eq!(
             allocation,
             JobsAllocation {
@@ -3386,6 +3556,103 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(layout.spaces, spaces);
         assert_eq!(layout.agents, agents);
         assert_eq!(layout.toggle, expanded_sidebar_toggle_rect(area));
+    }
+
+    /// Finding 4: "at 100x7 expanded... after reserving the toggle H is 6,
+    /// so per the spec Jobs must HIDE." The `H < 7` hide test must key off
+    /// *post*-toggle usable height, not `content_height` itself -- both
+    /// carves agree at this exact boundary.
+    #[test]
+    fn degradation_at_height_7_hides_jobs_in_both_carves() {
+        let jobs = jobs_want(4, 12);
+        assert_eq!(jobs_allocation(jobs, 7), JobsAllocation::NONE);
+        assert_eq!(jobs_allocation_collapsed(jobs, 7), JobsAllocation::NONE);
+
+        let area = Rect::new(0, 0, 26, 7);
+        let expanded = compute_expanded_sidebar_layout(area, 0.5, jobs);
+        assert_eq!(expanded.jobs, Rect::default());
+        assert_ne!(expanded.spaces, Rect::default());
+        assert_ne!(expanded.agents, Rect::default());
+
+        let collapsed = compute_collapsed_sidebar_layout(area, jobs);
+        assert_eq!(collapsed.jobs, Rect::default());
+    }
+
+    /// Finding 4: "at 100x18-19 collapsed with 12 wanted rows, the shared
+    /// allocator leaves a 6-row remainder and the collapsed helper then
+    /// drops Agents entirely." The collapsed carve's own allocator
+    /// (`min_remainder == 7`) must leave enough for
+    /// `collapsed_sidebar_sections` to keep showing both Spaces and Agents.
+    #[test]
+    fn degradation_at_heights_18_and_19_keeps_agents_visible_in_the_collapsed_carve() {
+        let jobs = jobs_want(12, 12);
+        for height in [18u16, 19] {
+            let area = Rect::new(0, 0, 26, height);
+            let layout = compute_collapsed_sidebar_layout(area, jobs);
+            assert_ne!(
+                layout.jobs,
+                Rect::default(),
+                "jobs should still show at height {height}"
+            );
+            assert_ne!(
+                layout.spaces,
+                Rect::default(),
+                "spaces must not vanish at height {height}"
+            );
+            assert_ne!(
+                layout.agents,
+                Rect::default(),
+                "agents must not vanish at height {height} (finding 4)"
+            );
+
+            // The expanded carve's own (looser) floor was never broken by
+            // this bug, but both carves are checked at every finding-4
+            // height per the fix's instructions.
+            let expanded = compute_expanded_sidebar_layout(area, 0.5, jobs);
+            assert_ne!(expanded.jobs, Rect::default());
+            assert_ne!(expanded.spaces, Rect::default());
+            assert_ne!(expanded.agents, Rect::default());
+        }
+    }
+
+    /// Finding 4: "rendering removes [Agents'] last row even though the
+    /// toggle now sits below Jobs." Once Jobs is showing, the toggle is a
+    /// genuinely separate reserved row below it -- it must not still eat an
+    /// Agents row too.
+    #[test]
+    fn collapsed_render_does_not_waste_an_agents_row_once_jobs_reserves_its_own_toggle_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        app.sidebar_collapsed = true;
+        app.sidebar_list = crate::config::ListSectionConfig {
+            enabled: true,
+            ..crate::config::ListSectionConfig::default()
+        };
+        app.jobs = JobsSectionState {
+            title: Some("JOBS".to_string()),
+            summary: Some("1R".to_string()),
+            groups: vec![ParsedGroup {
+                id: "running".into(),
+                label: "Running".into(),
+                rows: vec![sample_row("1", &["ued", "1N", "0:01"], RowStyle::Normal)],
+            }],
+            mode: "live".to_string(),
+            collapsed: false,
+            ..JobsSectionState::default()
+        };
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_collapsed_sidebar_layout(area, jobs_section_want(&app));
+        assert_ne!(layout.jobs, Rect::default(), "jobs should be showing");
+
+        // The toggle sits strictly below `agents` (detail_area), not inside
+        // it, so nothing needs trimming out of Agents' own rect.
+        assert!(
+            layout.toggle.y >= layout.agents.y + layout.agents.height,
+            "toggle {:?} should sit below agents {:?} once jobs reserves its own row",
+            layout.toggle,
+            layout.agents
+        );
     }
 
     #[test]
@@ -3550,7 +3817,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     // the pieces it hands back always tile the sidebar with no gaps and no
     // overlaps, for both carves and across the whole Jobs degradation table.
     #[test]
-    fn render_and_hit_test_geometry_tile_the_sidebar_with_no_gaps_or_overlaps() {
+    fn geometry_tiles_the_sidebar_with_no_gaps_or_overlaps() {
         for width in [0u16, 1, 2, 4, 10, 26] {
             for height in 0u16..=40 {
                 let area = Rect::new(3, 5, width, height);
@@ -3615,6 +3882,125 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                                 layout.agents.y,
                                 "{label}: spaces/agents must be adjacent at {area:?} jobs={jobs:?}"
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The design doc's actual render/hit-test agreement property, replacing
+    /// the geometry-only non-overlap check above (design doc: "the existing
+    /// render/hit-test 'agreement' test only asserts non-overlap. Replace it
+    /// with the real property the spec asks for: ... for every rendered row,
+    /// the rect the renderer draws into EQUALS the rect the hit-tester maps
+    /// that row from. That test is the whole point.").
+    ///
+    /// This actually renders into a `TestBackend` buffer and reads back what
+    /// landed at each `SidebarLayout::jobs_rows` entry's `rect` -- the exact
+    /// rect `AppState::jobs_row_hit_at` (`app/input/sidebar.rs`) maps a click
+    /// from -- and confirms that row's own identifying text is what's there.
+    /// A prior version of `render_jobs_section` computed its own row rects
+    /// via a second call to `jobs_content_layout` instead of consuming
+    /// `SidebarLayout::jobs_rows`; had the two ever disagreed (different
+    /// scroll clamping, a stale cache, ...), this test would have failed
+    /// while the old non-overlap-only version would not have.
+    #[test]
+    fn render_draws_each_jobs_row_into_exactly_the_rect_hit_testing_maps_it_from() {
+        // Narrow widths (covered separately by
+        // `geometry_tiles_the_sidebar_with_no_gaps_or_overlaps`) can leave a
+        // hit rect too thin to draw even one character of identifying text
+        // (e.g. a group chevron alone with zero label width) -- that's a
+        // legitimate space constraint, not a render/hit-test disagreement,
+        // so this test sticks to widths wide enough for content to always
+        // be checkable.
+        for width in [8u16, 14, 20, 26] {
+            for height in [7u16, 9, 12, 18, 19, 20, 30] {
+                for job_count in [0usize, 1, 3, 12, 30] {
+                    for collapsed in [false, true] {
+                        let rows: Vec<ParsedRow> = (0..job_count)
+                            .map(|index| {
+                                sample_row(
+                                    &index.to_string(),
+                                    &[&format!("job{index}"), "1N", "0:01:00"],
+                                    RowStyle::Normal,
+                                )
+                            })
+                            .collect();
+                        let groups = if rows.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![ParsedGroup {
+                                id: "running".into(),
+                                label: "Running".into(),
+                                rows,
+                            }]
+                        };
+                        let mut app = jobs_app(groups);
+                        app.sidebar_collapsed = collapsed;
+                        app.sidebar_list.max_visible_rows = 12;
+                        // A single fill column so the identifying cell text
+                        // never loses a competition for width against fixed
+                        // columns -- this test is about geometry agreement,
+                        // not column truncation (covered separately by
+                        // `jobs_column_rects_shrinks_gracefully_when_too_narrow`).
+                        app.sidebar_list.columns = vec![ColumnSpec {
+                            width: ColumnWidth::Fill,
+                            align: ColumnAlign::Left,
+                        }];
+                        let area = Rect::new(0, 0, width, height);
+
+                        // The single computed layout -- what a real client
+                        // would store on `ViewState` and what hit-testing
+                        // (`AppState::jobs_row_hit_at`) reads.
+                        let layout = compute_sidebar_layout(&app, area);
+
+                        let mut terminal =
+                            Terminal::new(TestBackend::new(width.max(1), height.max(1)))
+                                .expect("test terminal should initialize");
+                        terminal
+                            .draw(|frame| {
+                                if collapsed {
+                                    render_sidebar_collapsed(&app, frame, area, &layout);
+                                } else {
+                                    render_sidebar(
+                                        &app,
+                                        &TerminalRuntimeRegistry::new(),
+                                        frame,
+                                        area,
+                                        &layout,
+                                    );
+                                }
+                            })
+                            .expect("sidebar should render");
+                        let buffer = terminal.backend().buffer();
+
+                        for hit in &layout.jobs_rows {
+                            let text = row_text(buffer, hit.rect.y, hit.rect.x + hit.rect.width);
+                            if hit.kind == JobRowHitKind::Group {
+                                // A short, truncation-resistant prefix of
+                                // "Running" -- the group header label has no
+                                // fill-column budget of its own (it isn't
+                                // subject to `sidebar_list.columns` at all),
+                                // so at the narrowest widths in this sweep it
+                                // legitimately truncates the label itself,
+                                // just not down past a few characters.
+                                assert!(
+                                    text.contains("Run"),
+                                    "collapsed={collapsed} {width}x{height} jobs={job_count}: \
+                                     group header hit rect {:?} drew {text:?}, not the group label",
+                                    hit.rect
+                                );
+                            } else {
+                                let expected = format!("job{}", hit.row_id);
+                                assert!(
+                                    text.contains(&expected),
+                                    "collapsed={collapsed} {width}x{height} jobs={job_count}: \
+                                     row {} hit rect {:?} drew {text:?}, expected to contain {expected:?}",
+                                    hit.row_id,
+                                    hit.rect
+                                );
+                            }
                         }
                     }
                 }
@@ -4231,6 +4617,34 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(jobs_section_want(&app), JobsSectionWant::hidden());
     }
 
+    /// Finding 6: a provider that's broken from the very first poll never
+    /// sets `title`/`summary`/`groups`, but does set `is_stale`/`last_error`
+    /// -- the section must still show (a default "JOBS" header with a stale
+    /// indicator), not stay invisible with no clue anything is wrong.
+    #[test]
+    fn jobs_shows_the_default_header_on_a_first_ever_poll_failure() {
+        let mut app = AppState::test_new();
+        app.sidebar_list.enabled = true;
+        app.jobs.is_stale = true;
+        app.jobs.last_error = Some("failed to spawn: No such file or directory".to_string());
+
+        let want = jobs_section_want(&app);
+        assert!(want.enabled, "a first-poll failure must not hide the section");
+
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_sidebar_layout(&app, area);
+        assert_ne!(layout.jobs, Rect::default());
+
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
+        assert!(text.contains("JOBS"), "header text was {text:?}");
+        assert!(text.contains("stale"), "header text was {text:?}");
+    }
+
     #[test]
     fn jobs_content_rows_counts_header_group_headers_and_visible_rows() {
         let state = JobsSectionState {
@@ -4326,8 +4740,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.jobs.collapsed = true;
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
@@ -4348,8 +4763,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let app = jobs_app(vec![group]);
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
@@ -4370,8 +4786,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.jobs.last_success_label = Some("5m ago".to_string());
         let area = Rect::new(0, 0, 26, 20);
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
@@ -4401,7 +4818,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_list.max_visible_rows = 6;
         let area = Rect::new(0, 0, 26, 20);
 
-        let layout = compute_sidebar_layout(&app, area);
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         assert!(
             layout.jobs_scrollbar.is_some(),
             "ten rows under a cap of six should need a scrollbar"
@@ -4409,8 +4826,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert!(layout.jobs_rows.len() >= 2);
 
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -4438,6 +4856,47 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         }
     }
 
+    /// Finding 11: group and row ids share a namespace; nothing in the
+    /// protocol stops a job's `id` from coincidentally equaling its own
+    /// group's `id`. A row_id == group_id equality check would misrender
+    /// such a row as a second group header. `JobRowHitKind` must classify it
+    /// correctly regardless.
+    #[test]
+    fn a_row_id_that_collides_with_its_group_id_still_renders_as_a_row() {
+        let group = ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows: vec![
+                sample_row("running", &["colliding-job", "1N", "0:01"], RowStyle::Normal),
+                sample_row("2", &["other-job", "1N", "0:02"], RowStyle::Normal),
+            ],
+        };
+        let app = jobs_app(vec![group]);
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
+
+        assert_eq!(layout.jobs_rows.len(), 3, "1 group header + 2 job rows");
+        assert_eq!(layout.jobs_rows[0].kind, JobRowHitKind::Group);
+        assert_eq!(layout.jobs_rows[1].kind, JobRowHitKind::Row);
+        assert_eq!(layout.jobs_rows[1].row_id, "running");
+        assert_eq!(layout.jobs_rows[1].group_id, "running");
+        assert_eq!(layout.jobs_rows[2].kind, JobRowHitKind::Row);
+
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout2 = compute_expanded_sidebar_layout_for_test(&app, area);
+        terminal
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout2)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // The colliding row must draw as a job row (its cell text), not a
+        // second "Running" group header.
+        let text = row_text(buffer, layout.jobs_rows[1].rect.y, area.width);
+        assert!(text.contains("colliding-job"), "drew {text:?}");
+        assert!(!text.contains("Running"), "drew {text:?}");
+    }
+
     #[test]
     fn jobs_row_style_is_resolved_from_config_styles_by_name() {
         let group = ParsedGroup {
@@ -4447,7 +4906,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         };
         let app = jobs_app(vec![group]);
         let area = Rect::new(0, 0, 26, 20);
-        let layout = compute_sidebar_layout(&app, area);
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         let row_hit = layout
             .jobs_rows
             .iter()
@@ -4455,8 +4914,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("row should be visible");
 
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -4474,7 +4934,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         };
         let app = jobs_app(vec![group]);
         let area = Rect::new(0, 0, 26, 20);
-        let layout = compute_sidebar_layout(&app, area);
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         let row_hit = layout
             .jobs_rows
             .iter()
@@ -4482,8 +4942,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("row should be visible");
 
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
             .unwrap();
         let buffer = terminal.backend().buffer();
 

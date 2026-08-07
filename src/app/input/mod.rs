@@ -442,6 +442,12 @@ impl App {
                     }
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
                     MouseAction::JobsModeToggled => {
+                        // Design doc finding: a monotonic generation, bumped
+                        // on every mode change, so a poll launched under the
+                        // old mode can't be mistaken for current just
+                        // because a live -> history -> live round trip
+                        // landed back on the same mode string.
+                        self.list_poll_generation = self.list_poll_generation.wrapping_add(1);
                         self.mark_list_poll_due(std::time::Instant::now())
                     }
                     MouseAction::ContextMenu { menu, idx } => {
@@ -826,6 +832,14 @@ fn app_for_mouse_test() -> App {
     app.state.latest_release_notes_available = false;
     app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 20);
     app.state.view.terminal_area = ratatui::layout::Rect::new(26, 0, 80, 20);
+    // `sidebar_layout()` (hit-testing) only ever reads `view.sidebar_layout`
+    // -- never recomputes (design doc: "Layout — one source of truth") -- so
+    // this synthetic `AppState` needs it populated same as `compute_view`
+    // would. Callers that mutate anything sidebar-geometry-relevant
+    // afterward (`sidebar_collapsed`, `sidebar_section_split`, `sidebar_list`,
+    // `jobs`) must call `recompute_sidebar_layout_for_test()` again once
+    // they're done.
+    app.state.recompute_sidebar_layout_for_test();
     app
 }
 

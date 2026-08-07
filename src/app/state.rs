@@ -608,6 +608,19 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// Whether a [`JobRowHit`] represents a group header or an individual job
+/// row. Kept as an explicit tag rather than inferred from `row_id ==
+/// group_id` (finding: group and row ids share a namespace -- nothing in the
+/// provider protocol stops a row's `id` from coincidentally equaling some
+/// group's `id`, which would make a genuine job row misrender/mis-hit-test
+/// as a second group header under the old id-equality inference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobRowHitKind {
+    #[default]
+    Group,
+    Row,
+}
+
 /// Mouse hit target for one visible Jobs row (a job row or a group header).
 /// Identified by id, not index, so a poll that reorders rows doesn't strand a
 /// selection (design doc: "Selection is identified by row id, not index").
@@ -616,6 +629,7 @@ pub struct JobRowHit {
     pub rect: Rect,
     pub row_id: String,
     pub group_id: String,
+    pub kind: JobRowHitKind,
 }
 
 /// Mouse hit targets inside the Jobs section header row.
@@ -1292,11 +1306,18 @@ pub enum ContextMenuKind {
         right_click_passthrough: bool,
     },
     /// Right-click on a Jobs sidebar job row (design doc: "Actions live in a
-    /// context menu, not inline buttons"). `can_tail` is false for a pending
-    /// job whose `%o`/`%e` paths are still unresolved templates, so "Tail
-    /// log" has nothing to tail.
+    /// context menu, not inline buttons"). `can_cancel`/`can_tail` are the
+    /// INTERSECTION of the row's provider-authorized `actions` and the
+    /// configured `ui.sidebar.list.actions` (design doc: "That list is
+    /// AUTHORIZATION"), snapshotted when the menu opens. `can_tail` is also
+    /// false for a pending job whose `%o`/`%e` paths are still unresolved
+    /// templates, since the provider simply omits `tail` from `actions` in
+    /// that case. Neither flag alone is trusted at execution time --
+    /// `App::choose_list_action` re-checks the row's live `actions` before
+    /// freezing argv.
     Job {
         row_id: String,
+        can_cancel: bool,
         can_tail: bool,
     },
 }
@@ -1357,12 +1378,26 @@ impl ContextMenuState {
                 items.push("Close pane");
                 items
             }
-            ContextMenuKind::Job { can_tail: true, .. } => {
-                vec!["Cancel job", "Tail log", "Copy job ID"]
-            }
             ContextMenuKind::Job {
-                can_tail: false, ..
+                can_cancel: true,
+                can_tail: true,
+                ..
+            } => vec!["Cancel job", "Tail log", "Copy job ID"],
+            ContextMenuKind::Job {
+                can_cancel: true,
+                can_tail: false,
+                ..
             } => vec!["Cancel job", "Copy job ID"],
+            ContextMenuKind::Job {
+                can_cancel: false,
+                can_tail: true,
+                ..
+            } => vec!["Tail log", "Copy job ID"],
+            ContextMenuKind::Job {
+                can_cancel: false,
+                can_tail: false,
+                ..
+            } => vec!["Copy job ID"],
         }
     }
 }
@@ -1570,8 +1605,10 @@ pub struct AppState {
     /// `toast` as that single slot frees.
     pub list_notify_queue: std::collections::VecDeque<crate::list_section::protocol::ParsedNotify>,
     /// `notify[].id`s already queued or shown, so a provider that keeps
-    /// reporting the same event across polls doesn't re-toast it.
-    pub list_notify_seen: std::collections::HashSet<String>,
+    /// reporting the same event across polls doesn't re-toast it. Bounded
+    /// (design doc finding: an unbounded set here retains one string per id
+    /// forever) -- see `list_notify::BoundedIdSet`.
+    pub list_notify_seen: crate::app::list_notify::BoundedIdSet,
     /// The Jobs sidebar action awaiting Enter/Escape confirmation (design
     /// doc: "Actions"). Frozen at menu-selection time; never re-resolved.
     pub list_action_confirm: Option<ListActionConfirmState>,
@@ -1848,6 +1885,20 @@ pub fn key_matches(
 
 #[cfg(test)]
 impl AppState {
+    /// Test-only escape hatch for populating `view.sidebar_layout` without
+    /// going through the full `compute_view` (which also resizes pane
+    /// runtimes, tab bars, etc. that a hit-testing-focused test may not want
+    /// to set up). Design doc: "Layout — one source of truth" -- hit-testing
+    /// (`sidebar_layout()`) only ever reads the cached `view.sidebar_layout`,
+    /// never recomputes, so a test that constructs `AppState` fields by hand
+    /// (rather than calling `compute_view`) must populate this cache itself,
+    /// after every field that affects sidebar geometry (`sidebar_collapsed`,
+    /// `sidebar_section_split`, `sidebar_list`, `jobs`, `view.sidebar_rect`)
+    /// is set -- mirroring `compute_view`'s own contract.
+    pub(crate) fn recompute_sidebar_layout_for_test(&mut self) {
+        self.view.sidebar_layout = crate::ui::compute_sidebar_layout(self, self.view.sidebar_rect);
+    }
+
     /// Create an AppState for testing — no channels, no PTYs.
     pub fn test_new() -> Self {
         Self {
@@ -1958,7 +2009,7 @@ impl AppState {
             },
             jobs: JobsSectionState::default(),
             list_notify_queue: std::collections::VecDeque::new(),
-            list_notify_seen: std::collections::HashSet::new(),
+            list_notify_seen: crate::app::list_notify::BoundedIdSet::default(),
             list_action_confirm: None,
             next_agent_state_change_seq: 0,
             mouse_capture: true,

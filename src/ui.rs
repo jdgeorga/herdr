@@ -89,6 +89,7 @@ pub(crate) use self::{
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_sidebar_layout, compute_workspace_card_areas,
+        compute_workspace_card_areas_from_layout,
         expanded_sidebar_sections, expanded_sidebar_toggle_rect, jobs_list_scroll_metrics,
         normalized_workspace_scroll, sidebar_section_divider_rect, sidebar_section_ratio_for_row,
         workspace_drop_slots,
@@ -273,7 +274,11 @@ fn compute_view_internal(
     let workspace_card_areas = if app.sidebar_collapsed {
         Vec::new()
     } else {
-        compute_workspace_card_areas(app, sidebar_area)
+        // Reuses the Spaces rect `compute_sidebar_layout` already carved
+        // above rather than re-deriving it via a second
+        // `compute_expanded_sidebar_layout` call (design doc: "Layout — one
+        // source of truth").
+        compute_workspace_card_areas_from_layout(app, sidebar_layout.spaces)
     };
 
     let tab_bar_view = app
@@ -488,9 +493,20 @@ fn render_navigation_chrome(
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
     } else if app.view.sidebar_rect.width > 0 {
         if app.sidebar_collapsed {
-            render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
+            render_sidebar_collapsed(
+                app,
+                frame,
+                app.view.sidebar_rect,
+                &app.view.sidebar_layout,
+            );
         } else {
-            render_sidebar(app, terminal_runtimes, frame, app.view.sidebar_rect);
+            render_sidebar(
+                app,
+                terminal_runtimes,
+                frame,
+                app.view.sidebar_rect,
+                &app.view.sidebar_layout,
+            );
         }
     }
 }

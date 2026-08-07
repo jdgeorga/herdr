@@ -596,7 +596,7 @@ impl AppState {
                         } else if let Some(hit) =
                             self.jobs_row_hit_at(mouse.column, mouse.row)
                         {
-                            if hit.row_id == hit.group_id {
+                            if hit.kind == crate::app::state::JobRowHitKind::Group {
                                 self.toggle_jobs_group_collapsed(&hit.group_id);
                             } else {
                                 self.select_jobs_row(&hit.row_id);
@@ -1126,17 +1126,22 @@ impl AppState {
                 }
             }
 
-            MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
+            MouseEventKind::Down(MouseButton::Right) if in_sidebar => {
                 // Design doc mouse contract: right click on a job row opens
                 // its context menu, checked before this falls through to
-                // treating the click as a workspace right-click.
+                // treating the click as a workspace right-click. Jobs is
+                // rendered (and hit-testable) in both expanded and collapsed
+                // sidebars, so this must run before the `sidebar_collapsed`
+                // gate below, not be skipped by it.
                 if self.jobs_hit(mouse.column, mouse.row) {
                     if let Some(hit) = self.jobs_row_hit_at(mouse.column, mouse.row) {
-                        if hit.row_id != hit.group_id {
+                        if hit.kind == crate::app::state::JobRowHitKind::Row {
+                            let can_cancel = self.jobs_row_can_cancel(&hit.row_id);
                             let can_tail = self.jobs_row_can_tail(&hit.row_id);
                             self.context_menu = Some(ContextMenuState {
                                 kind: ContextMenuKind::Job {
                                     row_id: hit.row_id,
+                                    can_cancel,
                                     can_tail,
                                 },
                                 x: mouse.column,
@@ -1146,6 +1151,10 @@ impl AppState {
                             self.mode = Mode::ContextMenu;
                         }
                     }
+                    return None;
+                }
+
+                if self.sidebar_collapsed {
                     return None;
                 }
 
@@ -4440,6 +4449,10 @@ mod tests {
             collapsed: false,
             ..crate::app::state::JobsSectionState::default()
         };
+        // `sidebar_collapsed`/`sidebar_list`/`jobs` all affect
+        // `SidebarLayout`; recompute now that every one of them is set (see
+        // `app_for_mouse_test`'s comment).
+        app.state.recompute_sidebar_layout_for_test();
         app
     }
 
@@ -4471,6 +4484,7 @@ mod tests {
             collapsed: false,
             ..crate::app::state::JobsSectionState::default()
         };
+        app.state.recompute_sidebar_layout_for_test();
         app
     }
 
@@ -4603,7 +4617,7 @@ mod tests {
                 .sidebar_layout()
                 .jobs_rows
                 .iter()
-                .find(|hit| hit.row_id == hit.group_id)
+                .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Group)
                 .expect("group header row")
                 .clone()
         };
@@ -4632,7 +4646,7 @@ mod tests {
         let row_hit = layout
             .jobs_rows
             .iter()
-            .find(|hit| hit.row_id != hit.group_id)
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Row)
             .expect("job row");
         let (x, y) = (row_hit.rect.x, row_hit.rect.y);
 
@@ -4648,7 +4662,7 @@ mod tests {
         let row_hit = layout
             .jobs_rows
             .iter()
-            .find(|hit| hit.row_id != hit.group_id)
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Row)
             .expect("job row")
             .clone();
 
@@ -4664,6 +4678,7 @@ mod tests {
             menu.kind,
             ContextMenuKind::Job {
                 row_id: "123".to_string(),
+                can_cancel: true,
                 can_tail: true,
             }
         );
@@ -4678,7 +4693,7 @@ mod tests {
         let row_hit = layout
             .jobs_rows
             .iter()
-            .find(|hit| hit.row_id != hit.group_id)
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Row)
             .expect("job row")
             .clone();
 
@@ -4692,6 +4707,64 @@ mod tests {
         assert_eq!(menu.items(), &["Cancel job", "Copy job ID"]);
     }
 
+    /// Finding 1: a Done/history row reports `actions: []` precisely so it
+    /// cannot be cancelled -- the context menu must honor that even though
+    /// `cancel`/`tail` are both configured.
+    #[test]
+    fn right_click_job_row_with_no_authorized_actions_offers_only_copy() {
+        let mut app = app_with_jobs(false);
+        app.state.jobs.groups[0].rows[0].actions = Vec::new();
+        let layout = app.state.sidebar_layout();
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Row)
+            .expect("job row")
+            .clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row_hit.rect.x,
+            row_hit.rect.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("context menu open");
+        assert_eq!(
+            menu.kind,
+            ContextMenuKind::Job {
+                row_id: "123".to_string(),
+                can_cancel: false,
+                can_tail: false,
+            }
+        );
+        assert_eq!(menu.items(), &["Copy job ID"]);
+    }
+
+    /// Finding 1: right click on a job row must work in the collapsed
+    /// sidebar too -- previously the whole match arm was gated on
+    /// `!sidebar_collapsed`, so this silently fell through to nothing.
+    #[test]
+    fn right_click_job_row_opens_context_menu_when_sidebar_collapsed() {
+        let mut app = app_with_jobs(true);
+        let layout = app.state.sidebar_layout();
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Row)
+            .expect("job row")
+            .clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row_hit.rect.x,
+            row_hit.rect.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().expect("context menu open");
+        assert_eq!(menu.items(), &["Cancel job", "Tail log", "Copy job ID"]);
+    }
+
     #[test]
     fn right_click_job_group_header_does_not_open_a_context_menu() {
         let mut app = app_with_jobs(false);
@@ -4699,7 +4772,7 @@ mod tests {
         let group_header = layout
             .jobs_rows
             .iter()
-            .find(|hit| hit.row_id == hit.group_id)
+            .find(|hit| hit.kind == crate::app::state::JobRowHitKind::Group)
             .expect("group header row")
             .clone();
 
