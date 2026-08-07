@@ -17,6 +17,9 @@ mod git_refresh;
 mod ids;
 mod input;
 pub(crate) mod pane_graphics;
+mod list_actions;
+mod list_notify;
+mod list_refresh;
 mod popup;
 mod runtime;
 mod runtime_mutations;
@@ -32,7 +35,7 @@ mod worktrees;
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
@@ -61,6 +64,7 @@ use crate::config::Config;
 use crate::events::AppEvent;
 
 pub use state::{AppState, Mode, ToastKind, ViewState};
+pub(crate) use list_refresh::{ListPollIdentity, ListPollOutcome};
 
 pub(crate) fn load_plugin_manifest(
     path: &str,
@@ -121,6 +125,25 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Design doc "Polling": scheduling state for the Jobs sidebar
+    /// list-section poller (`list_refresh.rs`). Mirrors the git-refresh
+    /// fields above, but the subprocess itself needs timeout/process-group/
+    /// output-cap handling `git_refresh` has no equivalent of.
+    pub(crate) last_list_poll: Instant,
+    pub(crate) last_list_poll_success: Option<Instant>,
+    pub(crate) list_poll_in_flight: bool,
+    pub(crate) list_poll_due_after_in_flight: bool,
+    /// pid of the currently in-flight poll's process group, if any.
+    /// Populated by the poll worker thread right after spawn and cleared
+    /// when it exits; read by `shutdown_list_poll` so the group can still be
+    /// killed even though the generic child tracker (`runtime.rs:12`) never
+    /// kills children on exit.
+    pub(crate) list_poll_child: Arc<Mutex<Option<u32>>>,
+    /// Bumped every time a Jobs sidebar action is launched (design doc:
+    /// "Actions"), so a background command's completion event can be matched
+    /// against the confirm dialog that launched it -- see
+    /// `ListActionConfirmState::generation`.
+    pub(crate) next_list_action_generation: u64,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -253,6 +276,30 @@ fn agent_panel_sort_from_config(
         crate::config::AgentPanelSortConfig::Spaces => state::AgentPanelSort::Spaces,
         crate::config::AgentPanelSortConfig::Priority => state::AgentPanelSort::Priority,
     }
+}
+
+/// The Jobs sidebar mode a fresh (or reset) session starts in: the first
+/// entry of `ui.sidebar.list.modes`, or `"live"` if that list is empty
+/// (design doc's default config always lists `["live", "history"]`, so the
+/// fallback only matters for a pathological config).
+fn default_jobs_mode(config: &Config) -> String {
+    config
+        .ui
+        .sidebar
+        .list
+        .modes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "live".to_string())
+}
+
+/// A persisted Jobs mode is only honored if it's still one of the
+/// configured modes -- config may have changed (or shrunk) since the
+/// snapshot was written (design doc: "Persistence").
+fn resolve_persisted_jobs_mode(config: &Config, persisted: Option<String>) -> String {
+    persisted
+        .filter(|mode| config.ui.sidebar.list.modes.iter().any(|m| m == mode))
+        .unwrap_or_else(|| default_jobs_mode(config))
 }
 
 /// Parse the configured agent name list into a deduplicated set of `Agent`
@@ -398,6 +445,8 @@ impl App {
             sidebar_width_source,
             sidebar_section_split,
             collapsed_space_keys,
+            jobs_collapsed,
+            jobs_mode,
         ) = if no_session {
             (
                 Vec::new(),
@@ -407,6 +456,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                config.ui.sidebar.list.collapsed,
+                default_jobs_mode(config),
             )
         } else if let Some(snap) = crate::persist::load() {
             let history = config
@@ -443,6 +494,9 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.jobs_collapsed
+                        .unwrap_or(config.ui.sidebar.list.collapsed),
+                    resolve_persisted_jobs_mode(config, snap.jobs_mode),
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -460,6 +514,9 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.jobs_collapsed
+                        .unwrap_or(config.ui.sidebar.list.collapsed),
+                    resolve_persisted_jobs_mode(config, snap.jobs_mode),
                 )
             }
         } else {
@@ -471,6 +528,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                config.ui.sidebar.list.collapsed,
+                default_jobs_mode(config),
             )
         };
 
@@ -551,6 +610,7 @@ impl App {
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
+            request_submit_list_action: false,
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
@@ -588,6 +648,7 @@ impl App {
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                sidebar_layout: state::SidebarLayout::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -633,6 +694,15 @@ impl App {
             agent_view_override: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
+            sidebar_list: config.ui.sidebar.list.clone(),
+            jobs: state::JobsSectionState {
+                collapsed: jobs_collapsed,
+                mode: jobs_mode,
+                ..state::JobsSectionState::default()
+            },
+            list_notify_queue: std::collections::VecDeque::new(),
+            list_notify_seen: std::collections::HashSet::new(),
+            list_action_confirm: None,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -752,6 +822,19 @@ impl App {
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            // Already-due, like `last_git_remote_status_refresh` above, so
+            // the first poll fires on the next scheduled-tasks tick rather
+            // than waiting a full `refresh_seconds` after startup.
+            last_list_poll: Instant::now()
+                .checked_sub(Duration::from_secs(
+                    config.ui.sidebar.list.refresh_seconds.max(1),
+                ))
+                .unwrap_or_else(Instant::now),
+            last_list_poll_success: None,
+            list_poll_in_flight: false,
+            list_poll_due_after_in_flight: false,
+            list_poll_child: Arc::new(Mutex::new(None)),
+            next_list_action_generation: 1,
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
@@ -859,6 +942,11 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        if let Some(collapsed) = snapshot.jobs_collapsed {
+            app.state.jobs.collapsed = collapsed;
+        }
+        app.state.jobs.mode =
+            resolve_persisted_jobs_mode(config, snapshot.jobs_mode.clone());
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -1044,6 +1132,12 @@ impl App {
                 needs_render = true;
             }
 
+            if self.state.request_submit_list_action {
+                self.state.request_submit_list_action = false;
+                self.submit_list_action_confirm();
+                needs_render = true;
+            }
+
             if self.state.request_reload_config {
                 self.state.request_reload_config = false;
                 self.reload_config();
@@ -1184,6 +1278,11 @@ impl App {
                 }
             }
         }
+
+        // Shutdown cancellation: the generic child tracker never kills
+        // children on exit (design doc: "Shutdown cancellation"), so an
+        // in-flight list-section poll needs its own explicit kill here.
+        self.shutdown_list_poll();
 
         // Save session on exit (skip in --no-session mode)
         if !self.no_session {
@@ -1503,6 +1602,7 @@ impl App {
                 self.state.status_indicators = config.ui.status_indicators;
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
+                self.state.sidebar_list = config.ui.sidebar.list.clone();
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
@@ -1900,6 +2000,9 @@ impl App {
             Mode::ConfirmRemoveWorktree => {
                 self.handle_worktree_remove_key(key_event);
             }
+            Mode::ConfirmListAction => {
+                self.handle_list_action_confirm_key(key_event);
+            }
             Mode::Resize => {
                 self.handle_resize_key_via_api(key);
             }
@@ -2071,13 +2174,19 @@ mod tests {
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
+        let mut app = App::new(
             &Config::default(),
             true,
             None,
             api_rx,
             crate::api::EventHub::default(),
-        )
+        );
+        // Disable the Jobs list poller (enabled by default) so its own
+        // scheduling deadline can't contaminate the many generic scheduling
+        // tests built on this helper, mirroring how `AppState::test_new`
+        // disables it for the same reason (design doc's regression bar).
+        app.state.sidebar_list.enabled = false;
+        app
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {

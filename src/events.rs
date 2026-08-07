@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use crate::app::{ListPollIdentity, ListPollOutcome};
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
@@ -171,4 +172,24 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+    /// A Jobs sidebar list-section poll completed (design doc: "Polling").
+    /// `identity` is what the poll was fetching at launch time, compared
+    /// against the live mode/command at completion so a result that no
+    /// longer matches (mode toggled, or config reloaded mid-flight) is
+    /// discarded rather than applied.
+    ListSectionPolled {
+        identity: ListPollIdentity,
+        outcome: ListPollOutcome,
+    },
+    /// A Jobs sidebar action's background command finished (design doc:
+    /// "Actions": "run via std::process in a thread, then force an
+    /// immediate re-poll and toast the result"). `generation` is compared
+    /// against `AppState::list_action_confirm`'s own generation so a
+    /// confirm dialog that has since moved on to a different action isn't
+    /// closed by a stale completion.
+    ListActionFinished {
+        generation: u64,
+        label: String,
+        result: Result<(), String>,
+    },
 }

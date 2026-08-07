@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::detect::Agent;
@@ -46,32 +47,18 @@ impl SidebarTokenColor {
     pub(crate) fn ratatui(self) -> ratatui::style::Color {
         ratatui::style::Color::Rgb(self.r, self.g, self.b)
     }
-}
 
-impl Serialize for SidebarTokenColor {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b))
-    }
-}
-
-impl<'de> Deserialize<'de> for SidebarTokenColor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
+    /// Parses a `#RGB` or `#RRGGBB` hex color literal. Used both by the
+    /// `Deserialize` impl and by built-in defaults (e.g. the `list` section's
+    /// default `styles` table).
+    fn parse_hex(value: &str) -> Result<Self, String> {
         let hex = value.strip_prefix('#').filter(|hex| {
             hex.is_ascii()
                 && matches!(hex.len(), 3 | 6)
                 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
         let Some(hex) = hex else {
-            return Err(serde::de::Error::custom(
-                "sidebar token fg must be #RGB or #RRGGBB",
-            ));
+            return Err("sidebar token fg must be #RGB or #RRGGBB".to_string());
         };
         let (r, g, b) = if hex.len() == 3 {
             let mut digits = hex
@@ -90,6 +77,25 @@ impl<'de> Deserialize<'de> for SidebarTokenColor {
             )
         };
         Ok(Self { r, g, b })
+    }
+}
+
+impl Serialize for SidebarTokenColor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b))
+    }
+}
+
+impl<'de> Deserialize<'de> for SidebarTokenColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_hex(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -424,11 +430,318 @@ impl Default for SpacesSidebarConfig {
     }
 }
 
+/// Expands a single argv/path token's leading `~` at config-load time.
+///
+/// Argv execution itself never expands `~` (herdr only expands it in coded
+/// paths, e.g. `src/worktree.rs`), so any `~`-prefixed token in a `list`
+/// section command must be resolved here, before the token ever reaches
+/// `std::process::Command`.
+fn expand_tilde_token(token: &str) -> String {
+    if token == "~" || token.starts_with("~/") {
+        crate::worktree::expand_tilde_path(token)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        token.to_string()
+    }
+}
+
+fn deserialize_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let argv = Vec::<String>::deserialize(deserializer)?;
+    Ok(argv.iter().map(|token| expand_tilde_token(token)).collect())
+}
+
+fn deserialize_optional_path_token<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.map(|token| expand_tilde_token(&token)))
+}
+
+/// True when `token` still contains an unresolved `{...}` substitution
+/// placeholder. Used to reject substitution inside `argv[0]`: the executable
+/// itself is config-only, never built from provider-controlled row data.
+fn contains_substitution_token(token: &str) -> bool {
+    token.contains('{')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnWidth {
+    #[default]
+    Fill,
+    Fixed(u16),
+}
+
+impl Serialize for ColumnWidth {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Fill => serializer.serialize_str("fill"),
+            Self::Fixed(width) => serializer.serialize_u16(*width),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnWidth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawColumnWidth {
+            Fixed(u16),
+            Named(String),
+        }
+
+        match RawColumnWidth::deserialize(deserializer)? {
+            RawColumnWidth::Fixed(width) => Ok(Self::Fixed(width)),
+            RawColumnWidth::Named(name) if name == "fill" => Ok(Self::Fill),
+            RawColumnWidth::Named(name) => Err(serde::de::Error::custom(format!(
+                "unknown sidebar list column width `{name}`; expected \"fill\" or an integer"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnAlign {
+    #[default]
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnSpec {
+    pub width: ColumnWidth,
+    pub align: ColumnAlign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionTarget {
+    #[default]
+    Background,
+    Overlay,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListActionConfig {
+    pub id: String,
+    pub label: String,
+    #[serde(deserialize_with = "deserialize_argv")]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub confirm: Option<String>,
+    #[serde(default)]
+    pub target: ActionTarget,
+    #[serde(default, deserialize_with = "deserialize_optional_path_token")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub validate: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ListSectionConfig {
+    pub enabled: bool,
+    pub placement: ListPlacement,
+    pub collapsed: bool,
+    pub refresh_seconds: u64,
+    pub timeout_seconds: u64,
+    pub max_visible_rows: u16,
+    #[serde(deserialize_with = "deserialize_argv")]
+    pub command: Vec<String>,
+    pub modes: Vec<String>,
+    pub columns: Vec<ColumnSpec>,
+    pub styles: HashMap<String, SidebarTokenColor>,
+    pub actions: Vec<ListActionConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListPlacement {
+    #[default]
+    Bottom,
+}
+
+impl ListSectionConfig {
+    /// Load-time validation. Never panics; every violation becomes a
+    /// diagnostic string surfaced through the existing config-diagnostic
+    /// mechanism (`Config::collect_diagnostics`).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+
+        if self.command.is_empty() {
+            diagnostics.push(
+                "ui.sidebar.list.command must not be empty; the jobs list section is disabled"
+                    .to_string(),
+            );
+        } else if contains_substitution_token(&self.command[0]) {
+            diagnostics.push(format!(
+                "ui.sidebar.list.command[0] ({:?}) must not contain a substitution token; \
+                 the executable is config-only",
+                self.command[0]
+            ));
+        }
+
+        if self.refresh_seconds < 1 {
+            diagnostics.push(format!(
+                "ui.sidebar.list.refresh_seconds ({}) must be at least 1",
+                self.refresh_seconds
+            ));
+        }
+
+        if self.timeout_seconds < 1 {
+            diagnostics.push(format!(
+                "ui.sidebar.list.timeout_seconds ({}) must be at least 1",
+                self.timeout_seconds
+            ));
+        } else if self.timeout_seconds >= self.refresh_seconds {
+            diagnostics.push(format!(
+                "ui.sidebar.list.timeout_seconds ({}) must be less than refresh_seconds ({})",
+                self.timeout_seconds, self.refresh_seconds
+            ));
+        }
+
+        if self.modes.is_empty() {
+            diagnostics.push("ui.sidebar.list.modes must not be empty".to_string());
+        }
+
+        let mut seen_ids: Vec<&str> = Vec::new();
+        for action in &self.actions {
+            if seen_ids.contains(&action.id.as_str()) {
+                diagnostics.push(format!(
+                    "ui.sidebar.list.actions has duplicate id {:?}",
+                    action.id
+                ));
+            } else {
+                seen_ids.push(&action.id);
+            }
+
+            if action.command.is_empty() {
+                diagnostics.push(format!(
+                    "ui.sidebar.list.actions[{:?}].command must not be empty",
+                    action.id
+                ));
+            } else if contains_substitution_token(&action.command[0]) {
+                diagnostics.push(format!(
+                    "ui.sidebar.list.actions[{:?}].command[0] ({:?}) must not contain a \
+                     substitution token; the executable is config-only",
+                    action.id, action.command[0]
+                ));
+            }
+
+            for (token, pattern) in &action.validate {
+                if let Err(err) = Regex::new(pattern) {
+                    diagnostics.push(format!(
+                        "ui.sidebar.list.actions[{:?}].validate.{token} ({pattern:?}) is not a \
+                         valid regex: {err}",
+                        action.id
+                    ));
+                }
+            }
+        }
+
+        diagnostics
+    }
+}
+
+impl Default for ListSectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            placement: ListPlacement::Bottom,
+            collapsed: true,
+            refresh_seconds: 10,
+            timeout_seconds: 5,
+            max_visible_rows: 12,
+            command: vec![
+                "/usr/bin/python3.11".to_string(),
+                expand_tilde_token("~/.config/herdr/scripts/herdr-jobs.py"),
+                "--mode".to_string(),
+                "{mode}".to_string(),
+            ],
+            modes: vec!["live".to_string(), "history".to_string()],
+            columns: vec![
+                ColumnSpec {
+                    width: ColumnWidth::Fill,
+                    align: ColumnAlign::Left,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(3),
+                    align: ColumnAlign::Right,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(7),
+                    align: ColumnAlign::Right,
+                },
+            ],
+            styles: HashMap::from([
+                ("ok".to_string(), parse_style_hex("#b8bb26")),
+                ("fail".to_string(), parse_style_hex("#fb4934")),
+                ("warn".to_string(), parse_style_hex("#fabd2f")),
+                ("muted".to_string(), parse_style_hex("#928374")),
+                ("normal".to_string(), parse_style_hex("#ebdbb2")),
+            ]),
+            actions: vec![
+                ListActionConfig {
+                    id: "cancel".to_string(),
+                    label: "Cancel job".to_string(),
+                    command: vec![
+                        "scancel".to_string(),
+                        "--".to_string(),
+                        "{id}".to_string(),
+                    ],
+                    confirm: Some("Cancel job {id} ({cell0})?".to_string()),
+                    target: ActionTarget::Background,
+                    cwd: None,
+                    validate: HashMap::from([(
+                        "id".to_string(),
+                        r"^[0-9]+(_[0-9]+)?(\+[0-9]+)?$".to_string(),
+                    )]),
+                },
+                ListActionConfig {
+                    id: "tail".to_string(),
+                    label: "Tail log".to_string(),
+                    command: vec![
+                        "tail".to_string(),
+                        "-f".to_string(),
+                        "--".to_string(),
+                        "{log}".to_string(),
+                    ],
+                    confirm: None,
+                    target: ActionTarget::Overlay,
+                    cwd: Some("{dir}".to_string()),
+                    validate: HashMap::new(),
+                },
+            ],
+        }
+    }
+}
+
+/// Parses a default `#RRGGBB` style color. Only used to build the built-in
+/// default style table; the `expect` is unreachable since every literal here
+/// is a valid, test-covered hex string.
+fn parse_style_hex(hex: &str) -> SidebarTokenColor {
+    SidebarTokenColor::parse_hex(hex).expect("default style color must parse")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
+    pub list: ListSectionConfig,
 }
 
 #[cfg(test)]
@@ -643,5 +956,317 @@ rows = [[{ token = "git_status", fg = "#ff00aa" }], [{ token = "$jj", bold = tru
                 "accepted key {key:?}"
             );
         }
+    }
+
+    // --- ui.sidebar.list ---
+
+    #[test]
+    fn list_section_config_defaults_match_the_spec_example() {
+        // Defaults expand `~` against $HOME; hold the shared env lock so a
+        // concurrent test mutating HOME can't race this read.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let list = ListSectionConfig::default();
+
+        assert!(list.enabled);
+        assert_eq!(list.placement, ListPlacement::Bottom);
+        assert!(list.collapsed);
+        assert_eq!(list.refresh_seconds, 10);
+        assert_eq!(list.timeout_seconds, 5);
+        assert_eq!(list.max_visible_rows, 12);
+        assert_eq!(
+            list.command,
+            vec![
+                "/usr/bin/python3.11".to_string(),
+                expand_tilde_token("~/.config/herdr/scripts/herdr-jobs.py"),
+                "--mode".to_string(),
+                "{mode}".to_string(),
+            ]
+        );
+        assert_eq!(list.modes, vec!["live".to_string(), "history".to_string()]);
+        assert_eq!(
+            list.columns,
+            vec![
+                ColumnSpec {
+                    width: ColumnWidth::Fill,
+                    align: ColumnAlign::Left,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(3),
+                    align: ColumnAlign::Right,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(7),
+                    align: ColumnAlign::Right,
+                },
+            ]
+        );
+        assert_eq!(list.styles.len(), 5);
+        assert_eq!(
+            list.styles["ok"].ratatui(),
+            ratatui::style::Color::Rgb(0xb8, 0xbb, 0x26)
+        );
+        assert_eq!(list.actions.len(), 2);
+        assert_eq!(list.actions[0].id, "cancel");
+        assert_eq!(list.actions[0].target, ActionTarget::Background);
+        assert_eq!(list.actions[1].id, "tail");
+        assert_eq!(list.actions[1].target, ActionTarget::Overlay);
+        assert_eq!(list.actions[1].cwd.as_deref(), Some("{dir}"));
+
+        // The default config is itself load-time valid.
+        assert!(list.diagnostics().is_empty());
+
+        // SidebarConfig::default() wires the list section in.
+        assert_eq!(SidebarConfig::default().list, list);
+    }
+
+    #[test]
+    fn list_section_parses_from_toml_matching_the_spec_example() {
+        let config: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.list]
+enabled = true
+placement = "bottom"
+collapsed = true
+refresh_seconds = 10
+timeout_seconds = 5
+max_visible_rows = 12
+command = ["/usr/bin/python3.11", "/opt/herdr-jobs.py", "--mode", "{mode}"]
+modes = ["live", "history"]
+
+columns = [
+  { width = "fill", align = "left"  },
+  { width = 3,      align = "right" },
+  { width = 7,      align = "right" },
+]
+
+[ui.sidebar.list.styles]
+ok = "#b8bb26"
+fail = "#fb4934"
+
+[[ui.sidebar.list.actions]]
+id = "cancel"
+label = "Cancel job"
+command = ["scancel", "--", "{id}"]
+confirm = "Cancel job {id} ({cell0})?"
+validate = { id = "^[0-9]+(_[0-9]+)?(\\+[0-9]+)?$" }
+
+[[ui.sidebar.list.actions]]
+id = "tail"
+label = "Tail log"
+command = ["tail", "-f", "--", "{log}"]
+target = "overlay"
+cwd = "{dir}"
+"##,
+        )
+        .expect("list section config");
+
+        let list = &config.ui.sidebar.list;
+        assert_eq!(
+            list.columns,
+            vec![
+                ColumnSpec {
+                    width: ColumnWidth::Fill,
+                    align: ColumnAlign::Left,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(3),
+                    align: ColumnAlign::Right,
+                },
+                ColumnSpec {
+                    width: ColumnWidth::Fixed(7),
+                    align: ColumnAlign::Right,
+                },
+            ]
+        );
+        assert_eq!(list.actions[0].target, ActionTarget::Background);
+        assert_eq!(list.actions[1].target, ActionTarget::Overlay);
+        assert_eq!(list.actions[1].cwd.as_deref(), Some("{dir}"));
+        assert!(list.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn list_section_rejects_unknown_column_width() {
+        let input = r#"
+[ui.sidebar.list]
+columns = [{ width = "banana", align = "left" }]
+"#;
+        assert!(toml::from_str::<crate::config::Config>(input).is_err());
+    }
+
+    #[test]
+    fn list_section_rejects_unknown_fields_on_columns_and_actions() {
+        let input = r#"
+[ui.sidebar.list]
+columns = [{ width = "fill", align = "left", bogus = true }]
+"#;
+        assert!(toml::from_str::<crate::config::Config>(input).is_err());
+
+        let input = r#"
+[[ui.sidebar.list.actions]]
+id = "x"
+label = "X"
+command = ["true"]
+bogus = true
+"#;
+        assert!(toml::from_str::<crate::config::Config>(input).is_err());
+    }
+
+    #[test]
+    fn list_section_command_and_action_cwd_tilde_expand_at_load_time() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/test-user");
+
+        let result: Result<crate::config::Config, _> = toml::from_str(
+            r#"
+[ui.sidebar.list]
+command = ["/usr/bin/python3.11", "~/.config/herdr/scripts/herdr-jobs.py"]
+
+[[ui.sidebar.list.actions]]
+id = "tail"
+label = "Tail log"
+command = ["tail", "-f", "--", "{log}"]
+cwd = "~/logs"
+"#,
+        );
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let config = result.expect("list section config");
+        assert_eq!(
+            config.ui.sidebar.list.command,
+            vec![
+                "/usr/bin/python3.11".to_string(),
+                "/home/test-user/.config/herdr/scripts/herdr-jobs.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.ui.sidebar.list.actions[0].cwd.as_deref(),
+            Some("/home/test-user/logs")
+        );
+        // Substitution tokens are not paths and must survive untouched.
+        assert_eq!(config.ui.sidebar.list.actions[0].command[3], "{log}");
+    }
+
+    #[test]
+    fn diagnostics_flags_empty_command() {
+        let list = ListSectionConfig {
+            command: Vec::new(),
+            ..ListSectionConfig::default()
+        };
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("command must not be empty")));
+    }
+
+    #[test]
+    fn diagnostics_flags_substitution_token_in_argv0() {
+        let mut list = ListSectionConfig::default();
+        list.command[0] = "{mode}".to_string();
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("command[0]") && diag.contains("substitution token")));
+    }
+
+    #[test]
+    fn diagnostics_flags_refresh_seconds_below_one() {
+        let list = ListSectionConfig {
+            refresh_seconds: 0,
+            ..ListSectionConfig::default()
+        };
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("refresh_seconds") && diag.contains("at least 1")));
+    }
+
+    #[test]
+    fn diagnostics_flags_timeout_seconds_below_one() {
+        let list = ListSectionConfig {
+            timeout_seconds: 0,
+            ..ListSectionConfig::default()
+        };
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("timeout_seconds") && diag.contains("at least 1")));
+    }
+
+    #[test]
+    fn diagnostics_flags_timeout_seconds_not_less_than_refresh_seconds() {
+        let mut list = ListSectionConfig {
+            refresh_seconds: 5,
+            timeout_seconds: 5,
+            ..ListSectionConfig::default()
+        };
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("must be less than refresh_seconds")));
+
+        list.timeout_seconds = 6;
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("must be less than refresh_seconds")));
+    }
+
+    #[test]
+    fn diagnostics_flags_empty_modes() {
+        let list = ListSectionConfig {
+            modes: Vec::new(),
+            ..ListSectionConfig::default()
+        };
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("modes must not be empty")));
+    }
+
+    #[test]
+    fn diagnostics_flags_duplicate_action_ids() {
+        let mut list = ListSectionConfig::default();
+        let mut duplicate = list.actions[0].clone();
+        duplicate.id = list.actions[1].id.clone();
+        list.actions.push(duplicate);
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("duplicate id")));
+    }
+
+    #[test]
+    fn diagnostics_flags_action_command_empty_and_argv0_substitution() {
+        let mut list = ListSectionConfig::default();
+        list.actions[0].command = Vec::new();
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("actions[\"cancel\"].command must not be empty")));
+
+        let mut list = ListSectionConfig::default();
+        list.actions[0].command[0] = "{id}".to_string();
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("actions[\"cancel\"].command[0]")
+                && diag.contains("substitution token")));
+    }
+
+    #[test]
+    fn diagnostics_flags_invalid_action_validate_regex() {
+        let mut list = ListSectionConfig::default();
+        list.actions[0]
+            .validate
+            .insert("id".to_string(), "(unclosed".to_string());
+        assert!(list
+            .diagnostics()
+            .iter()
+            .any(|diag| diag.contains("validate.id") && diag.contains("not a valid regex")));
     }
 }

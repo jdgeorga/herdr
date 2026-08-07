@@ -1564,10 +1564,7 @@ impl AppState {
             return;
         }
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
+        let detail_area = self.sidebar_layout().agents;
         self.agent_panel_scroll = crate::ui::agent_panel_scroll_for_target(
             self,
             detail_area,
@@ -2952,6 +2949,14 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            // Intercepted before this dispatch, in App::handle_internal_event
+            // (see `handle_list_section_polled`); never touches AppState
+            // directly. Kept for AppEvent exhaustiveness.
+            AppEvent::ListSectionPolled { .. } => Vec::new(),
+            // Intercepted before this dispatch, in App::handle_internal_event
+            // (see `handle_list_action_finished`); never touches AppState
+            // directly. Kept for AppEvent exhaustiveness.
+            AppEvent::ListActionFinished { .. } => Vec::new(),
         }
     }
 

@@ -23,8 +23,9 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
-    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
+    render_confirm_close_overlay, render_list_action_confirm_overlay,
+    render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
+    render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
@@ -63,9 +64,17 @@ pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };
 use self::tabs::render_tab_bar;
+// The two-way `expanded_sidebar_sections`/`collapsed_sidebar_sections` family
+// (and their toggle/divider counterparts) are now only reached through
+// `compute_sidebar_layout` in non-test builds -- callers migrated to the
+// single-source-of-truth `SidebarLayout`. They stay `pub(crate)` and
+// unchanged because pre-existing tests call them directly; see the design
+// doc's regression bar.
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect, list_action_confirm_button_rects,
+        list_action_confirm_popup_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -79,12 +88,13 @@ pub(crate) use self::{
         agent_entry_gap, agent_entry_height_in_body, agent_panel_body_rect, agent_panel_entries,
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
-        collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
-        workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry,
+        collapsed_sidebar_toggle_rect, compute_sidebar_layout, compute_workspace_card_areas,
+        expanded_sidebar_sections, expanded_sidebar_toggle_rect, jobs_list_scroll_metrics,
+        normalized_workspace_scroll, sidebar_section_divider_rect, sidebar_section_ratio_for_row,
+        workspace_drop_slots,
+        workspace_group_chevron_rect, workspace_list_entries, workspace_list_entries_expanded,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        AgentPanelEntry, WorkspaceListEntry,
     },
 };
 
@@ -243,10 +253,15 @@ fn compute_view_internal(
         .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, main_area))
         .unwrap_or((Rect::default(), main_area));
 
+    // Computed once here, stored on `app.view.sidebar_layout` below, and read
+    // by both rendering and hit-testing -- see the design doc's "Layout — one
+    // source of truth" section. Neither recomputes the allocation order.
+    let sidebar_layout = compute_sidebar_layout(app, sidebar_area);
+
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
-        let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
-        let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
+        let max_agent_scroll =
+            agent_panel_scroll_metrics(app, sidebar_layout.agents).max_offset_from_bottom;
         app.agent_panel_scroll = app.agent_panel_scroll.min(max_agent_scroll);
     } else {
         app.workspace_scroll = app
@@ -307,6 +322,7 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
+        sidebar_layout,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -370,6 +386,7 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
+        sidebar_layout: crate::app::state::SidebarLayout::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -454,6 +471,7 @@ pub fn render_with_runtime_registry(
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
+        Mode::ConfirmListAction => render_list_action_confirm_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),

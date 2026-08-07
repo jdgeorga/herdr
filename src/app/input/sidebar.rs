@@ -1,26 +1,178 @@
 use ratatui::layout::Rect;
 
-use crate::app::state::{AppState, ViewLayout};
+use crate::app::state::{AppState, JobRowHit, ViewLayout};
 
 use super::ScrollbarClickTarget;
 
+/// Small point-in-rect check local to this module, mirroring the equivalent
+/// private helper in `mouse.rs` -- the two aren't shared because `mouse`'s is
+/// private to that module (see the house style of inlining this check rather
+/// than threading a crate-wide helper through every `on_*`/`*_at` hit-test
+/// here).
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && col >= rect.x
+        && col < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+}
+
 impl AppState {
+    /// The sidebar geometry computed by `compute_view` (design doc: "Layout —
+    /// one source of truth"). Prefers the cached `ViewState` copy, matching
+    /// the same read-cache-else-recompute pattern `workspace_at_row` already
+    /// uses for `workspace_card_areas`: a handful of pre-existing tests set
+    /// `view.sidebar_rect` directly without calling `compute_view`, so a
+    /// default (never-populated) cache falls back to a fresh, equally correct
+    /// computation instead of returning stale/empty geometry.
+    pub(crate) fn sidebar_layout(&self) -> crate::app::state::SidebarLayout {
+        if self.view.sidebar_layout != crate::app::state::SidebarLayout::default() {
+            self.view.sidebar_layout.clone()
+        } else {
+            crate::ui::compute_sidebar_layout(self, self.view.sidebar_rect)
+        }
+    }
+
+    /// Whether `(col, row)` is inside the Jobs rect at all (design doc's
+    /// mouse contract: three call sites in `mouse.rs` must check this
+    /// *first*, before falling back to Spaces/Agents/the workspace click
+    /// path). Present in both expanded and collapsed sidebar layouts, since
+    /// `render_jobs_section` draws in both.
+    pub(super) fn jobs_hit(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.sidebar_layout().jobs, col, row)
+    }
+
+    pub(super) fn jobs_header_chevron_hit(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.sidebar_layout().jobs_header_hits.chevron, col, row)
+    }
+
+    pub(super) fn jobs_mode_toggle_hit(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.sidebar_layout().jobs_header_hits.mode_toggle, col, row)
+    }
+
+    pub(super) fn jobs_row_hit_at(&self, col: u16, row: u16) -> Option<JobRowHit> {
+        self.sidebar_layout()
+            .jobs_rows
+            .iter()
+            .find(|hit| rect_contains(hit.rect, col, row))
+            .cloned()
+    }
+
+    /// Whether the job with `row_id` currently lists `tail` among its
+    /// actions (design doc: pending jobs omit `tail` because `%o`/`%e` are
+    /// still unresolved templates), read straight off the last poll's parsed
+    /// rows rather than threaded through `JobRowHit`.
+    pub(super) fn jobs_row_can_tail(&self, row_id: &str) -> bool {
+        self.jobs
+            .groups
+            .iter()
+            .flat_map(|group| &group.rows)
+            .find(|row| row.id == row_id)
+            .is_some_and(|row| row.actions.iter().any(|action| action == "tail"))
+    }
+
+    /// Section-header chevron click (design doc mouse contract: "collapse /
+    /// expand, persisted").
+    pub(super) fn toggle_jobs_collapsed(&mut self) {
+        self.jobs.collapsed = !self.jobs.collapsed;
+        self.mark_session_dirty();
+    }
+
+    /// Mode-toggle click: cycles through `sidebar_list.modes` (design doc:
+    /// "cycle `live` <-> `history`"). The "immediate re-poll" half of that
+    /// gesture lives on `App`, not `AppState` -- see `MouseAction::JobsModeToggled`.
+    pub(super) fn cycle_jobs_mode(&mut self) {
+        let modes = &self.sidebar_list.modes;
+        if modes.is_empty() {
+            return;
+        }
+        let next = modes
+            .iter()
+            .position(|mode| *mode == self.jobs.mode)
+            .map_or(0, |idx| (idx + 1) % modes.len());
+        self.jobs.mode = modes[next].clone();
+        self.jobs.scroll = 0;
+        self.mark_session_dirty();
+    }
+
+    pub(super) fn toggle_jobs_group_collapsed(&mut self, group_id: &str) {
+        if !self.jobs.collapsed_group_ids.remove(group_id) {
+            self.jobs.collapsed_group_ids.insert(group_id.to_string());
+        }
+        self.mark_session_dirty();
+    }
+
+    pub(super) fn select_jobs_row(&mut self, row_id: &str) {
+        self.jobs.selected_row_id = Some(row_id.to_string());
+    }
+
+    pub(super) fn jobs_scrollbar_target_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<ScrollbarClickTarget> {
+        let layout = self.sidebar_layout();
+        let track = layout.jobs_scrollbar?;
+        if !rect_contains(track, col, row) {
+            return None;
+        }
+        let metrics = crate::ui::jobs_list_scroll_metrics(self, layout.jobs);
+        if let Some(grab_row_offset) = crate::ui::scrollbar_thumb_grab_offset(metrics, track, row) {
+            Some(ScrollbarClickTarget::Thumb { grab_row_offset })
+        } else {
+            Some(ScrollbarClickTarget::Track {
+                offset_from_bottom: crate::ui::scrollbar_offset_from_row(metrics, track, row),
+            })
+        }
+    }
+
+    pub(super) fn jobs_offset_for_drag_row(&self, row: u16, grab_row_offset: u16) -> Option<usize> {
+        let layout = self.sidebar_layout();
+        let track = layout.jobs_scrollbar?;
+        let metrics = crate::ui::jobs_list_scroll_metrics(self, layout.jobs);
+        Some(crate::ui::scrollbar_offset_from_drag_row(
+            metrics,
+            track,
+            row,
+            grab_row_offset,
+        ))
+    }
+
+    pub(super) fn set_jobs_offset_from_bottom(&mut self, offset_from_bottom: usize) {
+        let layout = self.sidebar_layout();
+        let metrics = crate::ui::jobs_list_scroll_metrics(self, layout.jobs);
+        self.jobs.scroll = metrics
+            .max_offset_from_bottom
+            .saturating_sub(offset_from_bottom);
+    }
+
+    pub(super) fn scroll_jobs(&mut self, delta: i16) {
+        let layout = self.sidebar_layout();
+        let max_scroll = crate::ui::jobs_list_scroll_metrics(self, layout.jobs).max_offset_from_bottom;
+        if delta.is_negative() {
+            self.jobs.scroll = self.jobs.scroll.saturating_sub(delta.unsigned_abs() as usize);
+        } else {
+            self.jobs.scroll = self
+                .jobs
+                .scroll
+                .saturating_add(delta as usize)
+                .min(max_scroll);
+        }
+    }
+
     pub(super) fn workspace_list_rect(&self) -> Rect {
-        let sidebar = self.view.sidebar_rect;
-        if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
+        if self.sidebar_collapsed {
             return Rect::default();
         }
-        crate::ui::workspace_list_rect(sidebar, self.sidebar_section_split)
+        self.sidebar_layout().spaces
     }
 
     pub(super) fn agent_panel_rect(&self) -> Rect {
-        let sidebar = self.view.sidebar_rect;
-        if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
+        if self.sidebar_collapsed {
             return Rect::default();
         }
-        let (_, detail_area) =
-            crate::ui::expanded_sidebar_sections(sidebar, self.sidebar_section_split);
-        detail_area
+        self.sidebar_layout().agents
     }
 
     pub(super) fn workspace_list_scrollbar_target_at(
@@ -238,7 +390,7 @@ impl AppState {
             return false;
         }
         let sidebar = self.view.sidebar_rect;
-        let toggle = crate::ui::expanded_sidebar_toggle_rect(sidebar);
+        let toggle = self.sidebar_layout().toggle;
         let on_toggle = toggle.width > 0
             && col >= toggle.x
             && col < toggle.x + toggle.width
@@ -252,11 +404,7 @@ impl AppState {
     }
 
     pub(super) fn on_sidebar_toggle(&self, col: u16, row: u16) -> bool {
-        let rect = if self.sidebar_collapsed {
-            crate::ui::collapsed_sidebar_toggle_rect(self.view.sidebar_rect)
-        } else {
-            crate::ui::expanded_sidebar_toggle_rect(self.view.sidebar_rect)
-        };
+        let rect = self.sidebar_layout().toggle;
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -276,26 +424,35 @@ impl AppState {
         if self.sidebar_collapsed {
             return false;
         }
-        let rect = crate::ui::sidebar_section_divider_rect(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
-        rect.width > 0
-            && col >= rect.x
-            && col < rect.x + rect.width
-            && row >= rect.y
-            && row < rect.y + rect.height
+        let layout = self.sidebar_layout();
+        let Some(divider_y) = layout.section_divider_y else {
+            return false;
+        };
+        layout.spaces.width > 0
+            && col >= layout.spaces.x
+            && col < layout.spaces.x + layout.spaces.width
+            && row == divider_y
     }
 
+    /// Converts a dragged row into the Spaces/Agents split ratio, against the
+    /// same remainder rendering applies the ratio to (Spaces stacked above
+    /// Agents, after Jobs and the toggle row are carved off) -- see
+    /// `sidebar_section_ratio_for_row`. Using a different rect here than
+    /// `expanded_sidebar_sections` renders against is exactly the bug this
+    /// refactor exists to prevent (design doc: "Layout — one source of
+    /// truth").
     pub(super) fn set_sidebar_section_split(&mut self, row: u16) {
-        let sidebar = self.view.sidebar_rect;
-        let content_height = sidebar.height;
-        if content_height < 6 {
+        let layout = self.sidebar_layout();
+        let remainder = Rect::new(
+            layout.spaces.x,
+            layout.spaces.y,
+            layout.spaces.width,
+            layout.spaces.height + layout.agents.height,
+        );
+        let Some(ratio) = crate::ui::sidebar_section_ratio_for_row(remainder, row) else {
             return;
-        }
-        let relative_y = row.saturating_sub(sidebar.y);
-        let ratio = (relative_y as f32) / (content_height as f32);
-        self.sidebar_section_split = ratio.clamp(0.1, 0.9);
+        };
+        self.sidebar_section_split = ratio;
         self.mark_session_dirty();
     }
 
@@ -321,7 +478,7 @@ impl AppState {
             return None;
         }
 
-        let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
+        let ws_area = self.sidebar_layout().spaces;
         if ws_area == Rect::default() || row < ws_area.y || row >= ws_area.y + ws_area.height {
             return None;
         }
@@ -338,7 +495,7 @@ impl AppState {
             return None;
         }
 
-        let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
+        let detail_area = self.sidebar_layout().agents;
         let detail_content_area = Rect::new(
             detail_area.x,
             detail_area.y,
@@ -470,10 +627,7 @@ impl AppState {
             return false;
         }
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
+        let detail_area = self.sidebar_layout().agents;
         let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
         rect.width > 0
             && col >= rect.x

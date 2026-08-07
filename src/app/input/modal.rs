@@ -1379,6 +1379,16 @@ impl App {
                     };
                 }
             }
+            (ContextMenuKind::Job { row_id, .. }, Some("Cancel job")) => {
+                self.choose_list_action(&row_id, "cancel");
+            }
+            (ContextMenuKind::Job { row_id, .. }, Some("Tail log")) => {
+                self.choose_list_action(&row_id, "tail");
+            }
+            (ContextMenuKind::Job { row_id, .. }, Some("Copy job ID")) => {
+                self.state.request_clipboard_write = Some(row_id.into_bytes());
+                leave_modal(&mut self.state);
+            }
             _ => leave_modal(&mut self.state),
         }
     }
