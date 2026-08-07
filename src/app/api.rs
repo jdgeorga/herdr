@@ -166,6 +166,21 @@ impl App {
             return Vec::new();
         }
 
+        if let AppEvent::ListSectionPolled { identity, outcome } = ev {
+            self.handle_list_section_polled(identity, outcome);
+            return;
+        }
+
+        if let AppEvent::ListActionFinished {
+            generation,
+            label,
+            result,
+        } = ev
+        {
+            self.handle_list_action_finished(generation, label, result);
+            return;
+        }
+
         if let AppEvent::PluginCommandFinished {
             log_id,
             finished_unix_ms,

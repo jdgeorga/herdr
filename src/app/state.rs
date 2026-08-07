@@ -654,6 +654,100 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// Mouse hit target for one visible Jobs row (a job row or a group header).
+/// Identified by id, not index, so a poll that reorders rows doesn't strand a
+/// selection (design doc: "Selection is identified by row id, not index").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JobRowHit {
+    pub rect: Rect,
+    pub row_id: String,
+    pub group_id: String,
+}
+
+/// Mouse hit targets inside the Jobs section header row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JobsHeaderHits {
+    pub chevron: Rect,
+    pub mode_toggle: Rect,
+}
+
+/// Polled content for the Jobs sidebar section (design doc: "Provider
+/// protocol" / "Result state"). Populated by the list-section poller, which
+/// is not wired into `AppState` yet -- see `crate::list_section`. Defaults to
+/// an empty, user-collapsed state, so a freshly constructed `AppState` shows
+/// nothing until either a poll lands or a test injects content directly.
+///
+/// `collapsed` is the Jobs section's own header-chevron state (design doc:
+/// "collapsed by default"), independent of `SidebarLayout::jobs_collapsed`
+/// (which additionally covers the degradation table forcing a
+/// collapsed-header render when there isn't room for anything else).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobsSectionState {
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub groups: Vec<crate::list_section::protocol::ParsedGroup>,
+    /// Current mode string (e.g. `live`/`history`), matched against
+    /// `ListSectionConfig::modes`.
+    pub mode: String,
+    pub collapsed: bool,
+    pub collapsed_group_ids: std::collections::HashSet<String>,
+    pub selected_row_id: Option<String>,
+    /// Index of the first visible row in the (ungrouped-into-visible) body
+    /// plan -- group headers and job rows alike, in the same order
+    /// `ui::sidebar::jobs_body_plan` produces.
+    pub scroll: usize,
+    /// Pre-formatted display string (e.g. "5m ago"), set by whoever
+    /// populates this state. Rendering never does its own time math, mirroring
+    /// how the SLURM provider pre-formats its own time fields.
+    pub last_success_label: Option<String>,
+    pub is_stale: bool,
+    /// The most recent poll failure's description (design doc: "Result
+    /// state" carries `last_success`, `last_attempt`, `last_error`,
+    /// `is_stale`), cleared on the next successful poll. `last_attempt`
+    /// itself isn't tracked here: nothing renders it, and the poller already
+    /// has an equivalent internal deadline field (`App::last_list_poll`) for
+    /// scheduling.
+    pub last_error: Option<String>,
+}
+
+impl Default for JobsSectionState {
+    fn default() -> Self {
+        Self {
+            title: None,
+            summary: None,
+            groups: Vec::new(),
+            mode: "live".to_string(),
+            collapsed: true,
+            collapsed_group_ids: std::collections::HashSet::new(),
+            selected_row_id: None,
+            scroll: 0,
+            last_success_label: None,
+            is_stale: false,
+            last_error: None,
+        }
+    }
+}
+
+/// Sidebar geometry, computed once per frame in `compute_view`
+/// (`ui::compute_sidebar_layout`) and stored on `ViewState`. Rendering and
+/// hit-testing both read the same instance rather than each carving the
+/// sidebar independently -- see the design doc's "Layout — one source of
+/// truth" section. `jobs_rows`/`jobs_scrollbar`/`jobs_header_hits` reflect
+/// whatever `AppState::jobs` currently holds -- empty until a poller (not yet
+/// wired) or a test populates it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidebarLayout {
+    pub jobs: Rect,
+    pub jobs_collapsed: bool,
+    pub spaces: Rect,
+    pub agents: Rect,
+    pub section_divider_y: Option<u16>,
+    pub toggle: Rect,
+    pub jobs_rows: Vec<JobRowHit>,
+    pub jobs_scrollbar: Option<Rect>,
+    pub jobs_header_hits: JobsHeaderHits,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -676,6 +770,28 @@ pub struct WorktreeRemoveState {
     pub error: Option<String>,
     pub removing: bool,
     pub force_confirmation: bool,
+}
+
+/// A Jobs sidebar action awaiting confirmation (design doc: "Actions"),
+/// mirroring [`WorktreeRemoveState`]: `Mode::ConfirmListAction` is a unit
+/// variant and this is its payload. `argv`/`cwd` are resolved once, when the
+/// context-menu item is chosen, and frozen here -- by the time the user
+/// presses Enter, the row may be gone, its id reused, or the config
+/// reloaded, so re-resolving at confirm time would be a
+/// time-of-check/time-of-use bug (design doc calls this out explicitly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListActionConfirmState {
+    pub action_id: String,
+    pub label: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub prompt: String,
+    /// Bumped by `App` each time an action is launched; a completion event
+    /// carrying a stale generation is discarded rather than mutating a
+    /// confirm dialog that has since moved on to a different action.
+    pub generation: u64,
+    pub in_progress: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,6 +924,7 @@ pub enum ViewLayout {
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
+    pub sidebar_layout: SidebarLayout,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -837,6 +954,9 @@ pub enum Mode {
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
+    /// Confirming a Jobs sidebar action (design doc: "Actions"). Payload in
+    /// [`ListActionConfirmState`], mirroring `ConfirmRemoveWorktree`.
+    ConfirmListAction,
     Resize,
     ConfirmClose,
     ContextMenu,
@@ -871,6 +991,7 @@ impl Mode {
                 | Mode::Resize
                 | Mode::ConfirmClose
                 | Mode::ConfirmRemoveWorktree
+                | Mode::ConfirmListAction
                 | Mode::ContextMenu
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
@@ -1151,6 +1272,9 @@ pub(crate) enum DragTarget {
     AgentPanelScrollbar {
         grab_row_offset: u16,
     },
+    JobsScrollbar {
+        grab_row_offset: u16,
+    },
     PaneSplit {
         path: Vec<bool>,
         direction: Direction,
@@ -1215,6 +1339,14 @@ pub enum ContextMenuKind {
         has_manual_label: bool,
         right_click_passthrough: bool,
     },
+    /// Right-click on a Jobs sidebar job row (design doc: "Actions live in a
+    /// context menu, not inline buttons"). `can_tail` is false for a pending
+    /// job whose `%o`/`%e` paths are still unresolved templates, so "Tail
+    /// log" has nothing to tail.
+    Job {
+        row_id: String,
+        can_tail: bool,
+    },
 }
 
 /// Right-click context menu state.
@@ -1273,6 +1405,12 @@ impl ContextMenuState {
                 items.push("Close pane");
                 items
             }
+            ContextMenuKind::Job { can_tail: true, .. } => {
+                vec!["Cancel job", "Tail log", "Copy job ID"]
+            }
+            ContextMenuKind::Job {
+                can_tail: false, ..
+            } => vec!["Cancel job", "Copy job ID"],
         }
     }
 }
@@ -1398,6 +1536,11 @@ pub struct AppState {
     pub request_submit_worktree_create: bool,
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
+    /// Set when the Jobs sidebar action confirm dialog's "confirm" button is
+    /// clicked -- mirrors `request_submit_worktree_remove`, deferring the
+    /// actual `std::process` spawn to `App` (mouse hit-testing here runs on
+    /// `AppState` alone).
+    pub request_submit_list_action: bool,
     pub request_reload_config: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
@@ -1470,6 +1613,19 @@ pub struct AppState {
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
+    pub sidebar_list: crate::config::ListSectionConfig,
+    /// Polled Jobs sidebar content. See [`JobsSectionState`].
+    pub jobs: JobsSectionState,
+    /// Provider `notify` entries waiting to be shown as a toast (design doc:
+    /// "Notifications"): a bounded FIFO, cap 8, oldest dropped, drained into
+    /// `toast` as that single slot frees.
+    pub list_notify_queue: std::collections::VecDeque<crate::list_section::protocol::ParsedNotify>,
+    /// `notify[].id`s already queued or shown, so a provider that keeps
+    /// reporting the same event across polls doesn't re-toast it.
+    pub list_notify_seen: std::collections::HashSet<String>,
+    /// The Jobs sidebar action awaiting Enter/Escape confirmation (design
+    /// doc: "Actions"). Frozen at menu-selection time; never re-resolved.
+    pub list_action_confirm: Option<ListActionConfirmState>,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1786,6 +1942,7 @@ impl AppState {
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
+            request_submit_list_action: false,
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
@@ -1814,6 +1971,7 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                sidebar_layout: SidebarLayout::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -1863,6 +2021,19 @@ impl AppState {
             agent_view_override: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
+            // Disabled here (rather than the config default of `enabled: true`)
+            // so pre-existing sidebar tests built on `test_new` keep seeing
+            // today's Jobs-less layout -- the design doc's explicit regression
+            // bar ("with enabled = false, all pre-existing sidebar tests pass
+            // unchanged"). Tests exercising Jobs opt in explicitly.
+            sidebar_list: crate::config::ListSectionConfig {
+                enabled: false,
+                ..crate::config::ListSectionConfig::default()
+            },
+            jobs: JobsSectionState::default(),
+            list_notify_queue: std::collections::VecDeque::new(),
+            list_notify_seen: std::collections::HashSet::new(),
+            list_action_confirm: None,
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,
@@ -2266,6 +2437,7 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
+                ContextMenuKind::Job { .. } => {}
             }
         }
     }

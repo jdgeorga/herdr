@@ -527,12 +527,20 @@ mod tests {
     }
 
     fn test_app(config: &crate::config::Config) -> super::super::App {
-        super::super::App::new(
+        let mut app = super::super::App::new(
             config,
             true,
             None,
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
-        )
+        );
+        // These tests exercise git-refresh scheduling in isolation; disable
+        // the Jobs list poller (enabled by default) so its own deadline
+        // can't contaminate `next_loop_deadline`/`next_headless_loop_deadline_
+        // with_git_refresh` assertions here, mirroring how `AppState::
+        // test_new` disables it for the same reason (design doc's
+        // regression bar).
+        app.state.sidebar_list.enabled = false;
+        app
     }
 }

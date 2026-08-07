@@ -12,9 +12,11 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
-use crate::app::state::{AgentPanelSort, Palette};
+use crate::app::state::{AgentPanelSort, JobRowHit, JobsHeaderHits, JobsSectionState, Palette, SidebarLayout};
 use crate::app::{AppState, Mode};
+use crate::config::{ColumnAlign, ColumnSpec, ColumnWidth, ListSectionConfig};
 use crate::detect::AgentState;
+use crate::list_section::protocol::{ParsedGroup, ParsedRow, RowStyle};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
@@ -311,7 +313,8 @@ pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], i
 }
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    let ws_area = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
+        .spaces;
     let body = workspace_list_body_rect(ws_area, false);
     if body.height == 0 {
         return requested;
@@ -435,6 +438,11 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     entries
 }
 
+// Only exercised by tests now: production call sites moved to
+// `compute_sidebar_layout` so Jobs geometry is never recomputed with a
+// different formula. Kept (unchanged) because pre-existing tests call it
+// directly -- see the design doc's regression bar.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32) -> Rect {
     let (ws_area, _) = expanded_sidebar_sections(area, split_ratio);
     ws_area
@@ -659,7 +667,8 @@ pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
 ) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    let ws_area = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
+        .spaces;
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
     }
@@ -756,6 +765,770 @@ fn workspace_selection_background(p: &Palette, is_active: bool) -> Color {
     }
 }
 
+/// Content the Jobs section wants to draw, independent of geometry. Kept
+/// separate from [`JobsSectionState`] (the actual polled content) so the
+/// layout math below stays fully testable against the design doc's
+/// degradation table with synthetic row counts, without needing a real
+/// `AppState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobsSectionWant {
+    pub enabled: bool,
+    /// Rows the section wants to draw -- section header, group headers and
+    /// job rows alike (design doc: "`max_visible_rows` counts all rows the
+    /// section draws").
+    pub content_rows: u16,
+    pub max_visible_rows: u16,
+}
+
+impl JobsSectionWant {
+    pub(crate) const fn hidden() -> Self {
+        Self {
+            enabled: false,
+            content_rows: 0,
+            max_visible_rows: 0,
+        }
+    }
+}
+
+impl Default for JobsSectionWant {
+    fn default() -> Self {
+        Self::hidden()
+    }
+}
+
+/// Reads config + polled content off `app` into the shape the geometry math
+/// needs. The list-section poller itself is not wired into `AppState` yet
+/// (see `crate::list_section`), so `app.jobs` is empty by construction until
+/// either a poller or a test populates it; `app.sidebar_list.enabled`
+/// defaults to `false` in `AppState::test_new` specifically so pre-existing
+/// sidebar tests keep observing today's Jobs-less layout (the design doc's
+/// regression bar).
+fn jobs_section_want(app: &AppState) -> JobsSectionWant {
+    if !app.sidebar_list.enabled || !jobs_has_content(&app.jobs) {
+        return JobsSectionWant::hidden();
+    }
+    JobsSectionWant {
+        enabled: true,
+        content_rows: jobs_content_rows(&app.jobs),
+        max_visible_rows: app.sidebar_list.max_visible_rows,
+    }
+}
+
+/// Whether the poller has ever produced a result worth showing, distinct from
+/// a valid successful poll that legitimately found zero jobs (which does set
+/// `title`/`summary`, per the provider protocol's "a payload with no groups
+/// and no notifications is a valid, empty result"). The list-section poller
+/// itself is not wired into `AppState` yet, so `ListSectionConfig::enabled`
+/// defaulting to `true` would otherwise put a permanently-empty "JOBS" header
+/// into every sidebar today; gating on this too keeps that dormant until a
+/// poller (or a test) actually populates `AppState::jobs`.
+fn jobs_has_content(state: &JobsSectionState) -> bool {
+    state.title.is_some() || state.summary.is_some() || !state.groups.is_empty()
+}
+
+/// One line the Jobs section body draws, in top-to-bottom order, independent
+/// of scroll position or the height actually available. Shared by hit-rect
+/// computation ([`jobs_content_layout`]) and rendering ([`render_jobs_section`])
+/// so they cannot disagree about what's on screen.
+enum JobsPlanRow<'a> {
+    GroupHeader { group: &'a ParsedGroup },
+    Row {
+        group_id: &'a str,
+        row: &'a ParsedRow,
+    },
+}
+
+/// The Jobs section body, flattened: a group header for every group, and --
+/// unless that group is individually collapsed -- its rows right after it.
+/// Excludes the section's own header line, which is drawn separately and
+/// never scrolls. Whether a given group is collapsed is re-derived from
+/// `state.collapsed_group_ids` by id wherever it's needed (e.g.
+/// `render_jobs_section`) rather than carried on `JobsPlanRow` itself, since
+/// nothing here needs to remember it past deciding whether to emit rows.
+fn jobs_body_plan(state: &JobsSectionState) -> Vec<JobsPlanRow<'_>> {
+    let mut rows = Vec::new();
+    for group in &state.groups {
+        let collapsed = state.collapsed_group_ids.contains(&group.id);
+        rows.push(JobsPlanRow::GroupHeader { group });
+        if !collapsed {
+            for row in &group.rows {
+                rows.push(JobsPlanRow::Row {
+                    group_id: &group.id,
+                    row,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// All rows the section draws -- section header, group headers, and job rows
+/// alike (design doc: "`max_visible_rows` counts all rows the section
+/// draws"). When the section's own header is collapsed there is nothing else
+/// to count: the design doc's "collapsed by default" is a user choice to see
+/// only the header line, regardless of how much content exists underneath.
+fn jobs_content_rows(state: &JobsSectionState) -> u16 {
+    if state.collapsed {
+        return 1;
+    }
+    (1 + jobs_body_plan(state).len()).min(u16::MAX as usize) as u16
+}
+
+/// One outcome of the design doc's "Degradation policy" table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobsAllocation {
+    rows: u16,
+    collapsed_only: bool,
+}
+
+impl JobsAllocation {
+    const NONE: Self = Self {
+        rows: 0,
+        collapsed_only: false,
+    };
+}
+
+/// Implements the design doc's degradation table. `content_height` is the
+/// sidebar's content height *before* the toggle row is reserved (border
+/// already excluded, since the border only trims width) -- this is the `H`
+/// the table's last row ("`H < 7` => hidden entirely") gates on. The other
+/// three rows key off usable height *after* the toggle row, i.e.
+/// `content_height - 1`.
+///
+/// Below `content_height == 7` (so `content_height - 1 == 6`), giving Jobs
+/// even its minimum one collapsed row would leave only 5 rows for
+/// Spaces+Agents, one short of the stated 3-rows-each floor. The design doc
+/// states both "Jobs never starves Spaces/Agents below 3 rows each" and this
+/// exact one-row degradation row; they are not simultaneously satisfiable at
+/// `content_height == 7`. This implements the table literally (row 3 fires,
+/// minimum floor loses by one row at that single height) since the table is
+/// the piece the design doc asks to be tested row-by-row; see the
+/// `jobs_allocation` tests for the boundary.
+fn jobs_allocation(want: JobsSectionWant, content_height: u16) -> JobsAllocation {
+    if !want.enabled || content_height < 7 {
+        return JobsAllocation::NONE;
+    }
+    let wanted = want.content_rows.min(want.max_visible_rows);
+    if wanted == 0 {
+        return JobsAllocation::NONE;
+    }
+
+    let usable = content_height - 1; // after reserving the toggle row
+    if usable >= wanted.saturating_add(6) {
+        JobsAllocation {
+            rows: wanted,
+            collapsed_only: false,
+        }
+    } else if usable >= 7 {
+        JobsAllocation {
+            rows: usable - 6,
+            collapsed_only: false,
+        }
+    } else {
+        JobsAllocation {
+            rows: 1,
+            collapsed_only: true,
+        }
+    }
+}
+
+/// Carves `rows` off the bottom of `area` (Jobs sits above the toggle row,
+/// per the design doc's allocation order). Returns `(jobs_rect, remainder)`
+/// where `remainder` is what's left for Spaces/Agents to split.
+fn jobs_rect_from_bottom(area: Rect, rows: u16) -> (Rect, Rect) {
+    if rows == 0 || area.height == 0 {
+        return (Rect::default(), area);
+    }
+    let rows = rows.min(area.height);
+    let remainder_h = area.height - rows;
+    let jobs_rect = Rect::new(area.x, area.y + remainder_h, area.width, rows);
+    let remainder = Rect::new(area.x, area.y, area.width, remainder_h);
+    (jobs_rect, remainder)
+}
+
+fn sidebar_section_divider_row(area: Rect, split_ratio: f32) -> Option<u16> {
+    let rect = sidebar_section_divider_rect(area, split_ratio);
+    (rect != Rect::default()).then_some(rect.y)
+}
+
+/// Inverse of the Spaces/Agents split: converts a dragged divider row into a
+/// ratio against `remainder` -- the same rect [`expanded_sidebar_sections`]
+/// carves the split from (i.e. `SidebarLayout.spaces`/`.agents` stacked back
+/// together). Must stay paired with that function: if a drag computed the
+/// ratio against a different rect than rendering applies it to, the divider
+/// jumps (design doc: "Layout — one source of truth").
+pub(crate) fn sidebar_section_ratio_for_row(remainder: Rect, row: u16) -> Option<f32> {
+    if remainder.height < 6 {
+        return None;
+    }
+    let relative_y = row.saturating_sub(remainder.y);
+    Some(((relative_y as f32) / (remainder.height as f32)).clamp(0.1, 0.9))
+}
+
+/// Expanded-sidebar carve: border, then toggle, then Jobs from the bottom of
+/// what's left, then the existing Spaces/Agents split on the remainder. When
+/// Jobs is hidden this is byte-for-byte `expanded_sidebar_sections` +
+/// `expanded_sidebar_toggle_rect` on the untouched `area` -- the pre-Jobs
+/// behaviour -- since carving a toggle row that nothing else needs would
+/// itself be a behaviour change.
+pub(crate) fn compute_expanded_sidebar_layout(
+    area: Rect,
+    split_ratio: f32,
+    jobs: JobsSectionWant,
+) -> SidebarLayout {
+    let toggle = expanded_sidebar_toggle_rect(area);
+    let content_width = area.width.saturating_sub(1);
+    let content_height = if content_width == 0 { 0 } else { area.height };
+    let allocation = jobs_allocation(jobs, content_height);
+
+    if allocation.rows == 0 {
+        let (spaces, agents) = expanded_sidebar_sections(area, split_ratio);
+        return SidebarLayout {
+            jobs: Rect::default(),
+            jobs_collapsed: true,
+            spaces,
+            agents,
+            section_divider_y: sidebar_section_divider_row(area, split_ratio),
+            toggle,
+            jobs_rows: Vec::new(),
+            jobs_scrollbar: None,
+            jobs_header_hits: JobsHeaderHits::default(),
+        };
+    }
+
+    let above_toggle = Rect::new(area.x, area.y, area.width, area.height - 1);
+    let (jobs_rect, remainder) = jobs_rect_from_bottom(above_toggle, allocation.rows);
+    let (spaces, agents) = expanded_sidebar_sections(remainder, split_ratio);
+    // `remainder` keeps the full (border-inclusive) width so
+    // `expanded_sidebar_sections` can do its own border trim exactly as it
+    // does when Jobs is hidden; `jobs_rect` doesn't go through that function,
+    // so it needs its own trim here to match Spaces/Agents/the toggle in
+    // never drawing into the reserved border column (allocation order step
+    // 1: "reserve the rightmost column").
+    let jobs_rect = Rect::new(
+        jobs_rect.x,
+        jobs_rect.y,
+        jobs_rect.width.saturating_sub(1),
+        jobs_rect.height,
+    );
+    SidebarLayout {
+        jobs: jobs_rect,
+        jobs_collapsed: allocation.collapsed_only,
+        spaces,
+        agents,
+        section_divider_y: sidebar_section_divider_row(remainder, split_ratio),
+        toggle,
+        jobs_rows: Vec::new(),
+        jobs_scrollbar: None,
+        jobs_header_hits: JobsHeaderHits::default(),
+    }
+}
+
+/// Collapsed-sidebar carve. Asymmetric with the expanded path by design (see
+/// the design doc's "Collapsed mode is asymmetric" note):
+/// `collapsed_sidebar_sections` ignores `split_ratio`, uses a fixed half
+/// split, and drops Agents below seven rows -- this carves Jobs off first and
+/// then defers to it unchanged for the remainder, same as the expanded path
+/// defers to `expanded_sidebar_sections`.
+pub(crate) fn compute_collapsed_sidebar_layout(area: Rect, jobs: JobsSectionWant) -> SidebarLayout {
+    let toggle = collapsed_sidebar_toggle_rect(area);
+    let content_width = area.width.saturating_sub(1);
+    let content_height = if content_width == 0 { 0 } else { area.height };
+    let allocation = jobs_allocation(jobs, content_height);
+
+    if allocation.rows == 0 {
+        let (spaces, section_divider_y, agents) = collapsed_sidebar_sections(area);
+        return SidebarLayout {
+            jobs: Rect::default(),
+            jobs_collapsed: true,
+            spaces,
+            agents,
+            section_divider_y,
+            toggle,
+            jobs_rows: Vec::new(),
+            jobs_scrollbar: None,
+            jobs_header_hits: JobsHeaderHits::default(),
+        };
+    }
+
+    let above_toggle = Rect::new(area.x, area.y, area.width, area.height - 1);
+    let (jobs_rect, remainder) = jobs_rect_from_bottom(above_toggle, allocation.rows);
+    let (spaces, section_divider_y, agents) = collapsed_sidebar_sections(remainder);
+    // See the matching comment in `compute_expanded_sidebar_layout`: `jobs_rect`
+    // needs its own border-column trim since it doesn't pass through
+    // `collapsed_sidebar_sections`'s internal one.
+    let jobs_rect = Rect::new(
+        jobs_rect.x,
+        jobs_rect.y,
+        jobs_rect.width.saturating_sub(1),
+        jobs_rect.height,
+    );
+    SidebarLayout {
+        jobs: jobs_rect,
+        jobs_collapsed: allocation.collapsed_only,
+        spaces,
+        agents,
+        section_divider_y,
+        toggle,
+        jobs_rows: Vec::new(),
+        jobs_scrollbar: None,
+        jobs_header_hits: JobsHeaderHits::default(),
+    }
+}
+
+/// The single source of truth for sidebar geometry (design doc: "Layout —
+/// one source of truth"). Computed once per frame in `compute_view` and
+/// stored on `ViewState`; also called directly by the lower-level render/hit
+/// -test helpers below since several of them are unit-tested with synthetic
+/// areas that never go through `compute_view`. It is a pure function of
+/// `(app, area)`, so every caller agrees regardless of which path calls it.
+pub(crate) fn compute_sidebar_layout(app: &AppState, area: Rect) -> SidebarLayout {
+    let jobs = jobs_section_want(app);
+    let mut layout = if app.sidebar_collapsed {
+        compute_collapsed_sidebar_layout(area, jobs)
+    } else {
+        compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs)
+    };
+    if layout.jobs != Rect::default() {
+        let (jobs_rows, jobs_scrollbar, jobs_header_hits, _) =
+            jobs_content_layout(&app.jobs, &app.sidebar_list, layout.jobs);
+        layout.jobs_rows = jobs_rows;
+        layout.jobs_scrollbar = jobs_scrollbar;
+        layout.jobs_header_hits = jobs_header_hits;
+    }
+    layout
+}
+
+/// Clamps `scroll` against `total_rows`/`body_height` and derives the
+/// `ScrollMetrics` the existing scrollbar helpers expect. Every Jobs body row
+/// (group header or job row) is exactly one line tall, so this is simpler
+/// than the Spaces/Agents equivalents, which must additionally sum variable
+/// per-entry heights.
+fn jobs_scroll_metrics(
+    total_rows: usize,
+    body_height: u16,
+    scroll: usize,
+) -> (usize, crate::pane::ScrollMetrics) {
+    let body_height = body_height as usize;
+    let max_scroll = total_rows.saturating_sub(body_height);
+    let scroll = scroll.min(max_scroll);
+    let viewport_rows = total_rows.saturating_sub(scroll).min(body_height);
+    (
+        scroll,
+        crate::pane::ScrollMetrics {
+            offset_from_bottom: max_scroll - scroll,
+            max_offset_from_bottom: max_scroll,
+            viewport_rows,
+        },
+    )
+}
+
+/// `ScrollMetrics` for the Jobs body against a given `jobs_rect`, mirroring
+/// `workspace_list_scroll_metrics`/`agent_panel_scroll_metrics` -- used by
+/// mouse hit-testing (wheel clamping, scrollbar track/thumb) so it never
+/// needs to recompute `jobs_content_layout`'s row rects just to know how far
+/// the body can scroll.
+pub(crate) fn jobs_list_scroll_metrics(
+    app: &AppState,
+    jobs_rect: Rect,
+) -> crate::pane::ScrollMetrics {
+    if jobs_rect.height <= 1 {
+        return crate::pane::ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 0,
+            viewport_rows: 0,
+        };
+    }
+    let body_height = jobs_rect.height - 1;
+    let total_rows = jobs_body_plan(&app.jobs).len();
+    jobs_scroll_metrics(total_rows, body_height, app.jobs.scroll).1
+}
+
+/// Right-aligned label rect within `row_rect`, clipped to its width. Mirrors
+/// `agent_panel_header_label_rect`'s shape for a header line that isn't
+/// necessarily row 1 of its area.
+fn jobs_right_label_rect(row_rect: Rect, label: &str) -> Rect {
+    if row_rect.width == 0 {
+        return Rect::default();
+    }
+    let width = display_width_u16(label).min(row_rect.width);
+    Rect::new(
+        row_rect.x + row_rect.width.saturating_sub(width),
+        row_rect.y,
+        width,
+        1,
+    )
+}
+
+fn jobs_mode_toggle_text(config: &ListSectionConfig) -> String {
+    format!("[{}]", config.modes.join("|"))
+}
+
+fn jobs_stale_label(state: &JobsSectionState) -> Option<String> {
+    if !state.is_stale {
+        return None;
+    }
+    Some(match &state.last_success_label {
+        Some(label) => format!("stale · {label}"),
+        None => "stale".to_string(),
+    })
+}
+
+/// The text drawn on the right side of the section header, and whether it's
+/// the mode toggle (only the mode toggle gets a mouse hit target -- the stale
+/// label is informational). Staleness takes priority: there's no room to show
+/// both, and a stale result is the more actionable state to surface.
+fn jobs_header_right_text(state: &JobsSectionState, config: &ListSectionConfig, collapsed_style: bool) -> Option<(String, bool)> {
+    if let Some(stale) = jobs_stale_label(state) {
+        return Some((stale, false));
+    }
+    if collapsed_style || config.modes.len() < 2 {
+        return None;
+    }
+    Some((jobs_mode_toggle_text(config), true))
+}
+
+/// Computes the exact rects [`render_jobs_section`] will draw into, plus
+/// header hit targets. This is the single source of truth both
+/// `compute_sidebar_layout` (for `SidebarLayout::jobs_rows` et al, read by the
+/// hit-tester) and `render_jobs_section` call -- given the same `jobs_rect`
+/// and the same `AppState::jobs`/`AppState::sidebar_list`, a pure function
+/// cannot produce different rects for the two callers (design doc: "Layout —
+/// one source of truth").
+fn jobs_content_layout(
+    state: &JobsSectionState,
+    config: &ListSectionConfig,
+    jobs_rect: Rect,
+) -> (
+    Vec<JobRowHit>,
+    Option<Rect>,
+    JobsHeaderHits,
+    crate::pane::ScrollMetrics,
+) {
+    let no_scroll = crate::pane::ScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: 0,
+    };
+    if jobs_rect.width == 0 || jobs_rect.height == 0 {
+        return (Vec::new(), None, JobsHeaderHits::default(), no_scroll);
+    }
+
+    let header_rect = Rect::new(jobs_rect.x, jobs_rect.y, jobs_rect.width, 1);
+    let chevron_rect = Rect::new(header_rect.x, header_rect.y, 1, 1);
+    // Whenever there's only room for one row -- whether because the user
+    // collapsed the section or because the degradation table forced it down
+    // to its minimum -- show the collapsed-style header rather than a mode
+    // toggle with no list underneath it.
+    let collapsed_style = state.collapsed || jobs_rect.height <= 1;
+    let mode_toggle_rect = match jobs_header_right_text(state, config, collapsed_style) {
+        Some((text, true)) => jobs_right_label_rect(header_rect, &text),
+        _ => Rect::default(),
+    };
+    let header_hits = JobsHeaderHits {
+        chevron: chevron_rect,
+        mode_toggle: mode_toggle_rect,
+    };
+
+    if jobs_rect.height <= 1 {
+        return (Vec::new(), None, header_hits, no_scroll);
+    }
+
+    let body_rect = Rect::new(jobs_rect.x, jobs_rect.y + 1, jobs_rect.width, jobs_rect.height - 1);
+    let plan = jobs_body_plan(state);
+    let (scroll, metrics) = jobs_scroll_metrics(plan.len(), body_rect.height, state.scroll);
+    let has_scrollbar = should_show_scrollbar(metrics);
+    let content_width = body_rect.width.saturating_sub(u16::from(has_scrollbar));
+
+    let mut rows = Vec::new();
+    for (offset, plan_row) in plan.iter().skip(scroll).take(metrics.viewport_rows).enumerate() {
+        let rect = Rect::new(body_rect.x, body_rect.y + offset as u16, content_width, 1);
+        // Group headers use their own id as both `row_id` and `group_id` --
+        // the convention `render_jobs_section` and (eventually) the mouse
+        // handler use to tell a group header hit apart from a job row hit,
+        // since job row ids are guaranteed unique across the whole payload
+        // and so never legitimately collide with a group id here.
+        let (row_id, group_id) = match plan_row {
+            JobsPlanRow::GroupHeader { group } => (group.id.clone(), group.id.clone()),
+            JobsPlanRow::Row { group_id, row } => (row.id.clone(), (*group_id).to_string()),
+        };
+        rows.push(JobRowHit {
+            rect,
+            row_id,
+            group_id,
+        });
+    }
+
+    let scrollbar = has_scrollbar.then(|| {
+        Rect::new(
+            body_rect.x + body_rect.width.saturating_sub(1),
+            body_rect.y,
+            1,
+            body_rect.height,
+        )
+    });
+
+    (rows, scrollbar, header_hits, metrics)
+}
+
+fn row_style_name(style: RowStyle) -> &'static str {
+    match style {
+        RowStyle::Normal => "normal",
+        RowStyle::Ok => "ok",
+        RowStyle::Fail => "fail",
+        RowStyle::Warn => "warn",
+        RowStyle::Muted => "muted",
+    }
+}
+
+/// Resolves a row's style *name* against the config styles map (design doc:
+/// "`style` is a name resolved against config, never a color"), falling back
+/// to the main text color if the name isn't present (e.g. a user removed it
+/// from their `[ui.sidebar.list.styles]` table).
+fn resolve_row_style(config: &ListSectionConfig, style: RowStyle, p: &Palette) -> Style {
+    let color = config
+        .styles
+        .get(row_style_name(style))
+        .map(|color| color.ratatui())
+        .unwrap_or(p.text);
+    Style::default().fg(color)
+}
+
+/// Splits `row_rect` into one rect per `columns` entry: fixed columns get
+/// their configured width, fill columns split whatever's left evenly, and a
+/// single-column gap separates adjacent columns. Independent of
+/// `resolved_token_spans` -- see the design doc's note on why that helper
+/// isn't reused here.
+fn jobs_column_rects(row_rect: Rect, columns: &[ColumnSpec]) -> Vec<Rect> {
+    if columns.is_empty() || row_rect.width == 0 {
+        return Vec::new();
+    }
+
+    let gaps = (columns.len() - 1) as u16;
+    let fixed_total: u16 = columns
+        .iter()
+        .map(|column| match column.width {
+            ColumnWidth::Fixed(width) => width,
+            ColumnWidth::Fill => 0,
+        })
+        .sum();
+    let fill_count = columns
+        .iter()
+        .filter(|column| matches!(column.width, ColumnWidth::Fill))
+        .count() as u16;
+    let mut fill_budget = row_rect
+        .width
+        .saturating_sub(fixed_total)
+        .saturating_sub(gaps);
+    let mut fill_remaining = fill_count;
+
+    let right_edge = row_rect.x + row_rect.width;
+    let mut x = row_rect.x;
+    let mut rects = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            x = x.saturating_add(1).min(right_edge);
+        }
+        let width = match column.width {
+            ColumnWidth::Fixed(width) => width,
+            ColumnWidth::Fill if fill_remaining > 0 => {
+                let share = fill_budget / fill_remaining;
+                fill_budget -= share;
+                fill_remaining -= 1;
+                share
+            }
+            ColumnWidth::Fill => 0,
+        };
+        let width = width.min(right_edge.saturating_sub(x));
+        rects.push(Rect::new(x, row_rect.y, width, 1));
+        x = x.saturating_add(width);
+    }
+    rects
+}
+
+fn jobs_mode_toggle_spans(config: &ListSectionConfig, current_mode: &str, p: &Palette) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled("[", Style::default().fg(p.overlay0))];
+    for (index, mode) in config.modes.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("|", Style::default().fg(p.overlay0)));
+        }
+        let style = if mode == current_mode {
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(mode.clone(), style));
+    }
+    spans.push(Span::styled("]", Style::default().fg(p.overlay0)));
+    spans
+}
+
+fn render_jobs_header(
+    frame: &mut Frame,
+    header_hits: &JobsHeaderHits,
+    header_rect: Rect,
+    state: &JobsSectionState,
+    config: &ListSectionConfig,
+    collapsed_style: bool,
+    p: &Palette,
+) {
+    if header_rect.width == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            if collapsed_style { "▸" } else { "▾" },
+            Style::default().fg(p.accent),
+        )),
+        header_hits.chevron,
+    );
+
+    let right = jobs_header_right_text(state, config, collapsed_style);
+    let right_width = right
+        .as_ref()
+        .map(|(text, _)| display_width_u16(text))
+        .unwrap_or(0);
+    let gap = u16::from(right.is_some());
+    let left_x = header_rect.x.saturating_add(2);
+    let left_width = header_rect
+        .width
+        .saturating_sub(2)
+        .saturating_sub(right_width)
+        .saturating_sub(gap);
+
+    let title = state.title.as_deref().unwrap_or("JOBS");
+    let mut left = title.to_string();
+    if collapsed_style {
+        if let Some(summary) = state.summary.as_deref().filter(|s| !s.is_empty()) {
+            left = format!("{left}  {summary}");
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_end(&left, left_width as usize),
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(left_x, header_rect.y, left_width, 1),
+    );
+
+    match right {
+        Some((_, true)) => {
+            frame.render_widget(
+                Paragraph::new(Line::from(jobs_mode_toggle_spans(config, &state.mode, p))),
+                header_hits.mode_toggle,
+            );
+        }
+        Some((text, false)) => {
+            let rect = jobs_right_label_rect(header_rect, &text);
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::default().fg(p.peach))),
+                rect,
+            );
+        }
+        None => {}
+    }
+}
+
+fn render_jobs_group_header(frame: &mut Frame, rect: Rect, group: &ParsedGroup, collapsed: bool, p: &Palette) {
+    if rect.width == 0 {
+        return;
+    }
+    let label_width = rect.width.saturating_sub(2);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if collapsed { "▸ " } else { "▾ " },
+                Style::default().fg(p.accent),
+            ),
+            Span::styled(
+                truncate_end(&group.label, label_width as usize),
+                Style::default().fg(p.overlay1).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rect,
+    );
+}
+
+fn render_jobs_row(
+    frame: &mut Frame,
+    rect: Rect,
+    row: &ParsedRow,
+    config: &ListSectionConfig,
+    selected: bool,
+    p: &Palette,
+) {
+    if rect.width == 0 {
+        return;
+    }
+    if selected {
+        let buf = frame.buffer_mut();
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_style(Style::default().bg(p.surface0));
+        }
+    }
+
+    let style = resolve_row_style(config, row.style, p);
+    let column_rects = jobs_column_rects(rect, &config.columns);
+    for (index, column_rect) in column_rects.iter().enumerate() {
+        if column_rect.width == 0 {
+            continue;
+        }
+        let column = config.columns[index];
+        let text = row.cells.get(index).map(String::as_str).unwrap_or("");
+        let alignment = match column.align {
+            ColumnAlign::Left => Alignment::Left,
+            ColumnAlign::Right => Alignment::Right,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                truncate_end(text, column_rect.width as usize),
+                style,
+            ))
+            .alignment(alignment),
+            *column_rect,
+        );
+    }
+}
+
+/// Renders `layout.jobs` (design doc mockups: section header, group headers,
+/// job rows, stale indicator, scrollbar). Recomputes
+/// [`jobs_content_layout`] against the same `jobs_rect` its caller carved,
+/// rather than reading a cached `SidebarLayout` -- see the matching comment on
+/// `render_sidebar` for why, and note it is a pure function of
+/// `(app.jobs, app.sidebar_list, jobs_rect)` so it cannot disagree with what
+/// `compute_sidebar_layout` stores for hit-testing.
+fn render_jobs_section(app: &AppState, frame: &mut Frame, jobs_rect: Rect) {
+    if jobs_rect == Rect::default() {
+        return;
+    }
+    let p = &app.palette;
+    let state = &app.jobs;
+    let config = &app.sidebar_list;
+    let (rows, scrollbar, header_hits, metrics) = jobs_content_layout(state, config, jobs_rect);
+    let collapsed_style = state.collapsed || jobs_rect.height <= 1;
+    let header_rect = Rect::new(jobs_rect.x, jobs_rect.y, jobs_rect.width, 1);
+
+    render_jobs_header(frame, &header_hits, header_rect, state, config, collapsed_style, p);
+
+    for row_hit in &rows {
+        let Some(group) = state.groups.iter().find(|group| group.id == row_hit.group_id) else {
+            continue;
+        };
+        if row_hit.row_id == row_hit.group_id {
+            let collapsed = state.collapsed_group_ids.contains(&group.id);
+            render_jobs_group_header(frame, row_hit.rect, group, collapsed, p);
+        } else if let Some(row) = group.rows.iter().find(|row| row.id == row_hit.row_id) {
+            let selected = state.selected_row_id.as_deref() == Some(row.id.as_str());
+            render_jobs_row(frame, row_hit.rect, row, config, selected, p);
+        }
+    }
+
+    if let Some(track) = scrollbar {
+        render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
+    }
+}
+
 /// Collapsed sidebar: workspace glance on top, compact agent list below.
 pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
@@ -780,9 +1553,17 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area);
+    // Always the collapsed carve: which render function runs is the caller's
+    // decision (`render_navigation_chrome` branches on `app.sidebar_collapsed`
+    // before choosing between this and `render_sidebar`), not this function's
+    // -- tests draw this directly with `sidebar_collapsed` left at its
+    // default, so reading `app.sidebar_collapsed` here would pick the wrong
+    // carve for them.
+    let layout = compute_collapsed_sidebar_layout(area, jobs_section_want(app));
+    let (ws_area, divider_y, detail_area) = (layout.spaces, layout.section_divider_y, layout.agents);
+    render_jobs_section(app, frame, layout.jobs);
     if ws_area == Rect::default() {
-        render_sidebar_toggle(app, frame, area, true, p);
+        render_sidebar_toggle(app, frame, layout.toggle, true, p);
         return;
     }
 
@@ -879,7 +1660,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         }
     }
 
-    render_sidebar_toggle(app, frame, area, true, p);
+    render_sidebar_toggle(app, frame, layout.toggle, true, p);
 }
 
 pub(crate) fn workspace_drop_slots(
@@ -1002,11 +1783,14 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+    // Always the expanded carve -- see the matching comment in
+    // `render_sidebar_collapsed`.
+    let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app));
 
-    render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
-    render_agent_detail(app, terminal_runtimes, frame, detail_area);
-    render_sidebar_toggle(app, frame, area, false, p);
+    render_workspace_list(app, terminal_runtimes, frame, layout.spaces, is_navigating);
+    render_agent_detail(app, terminal_runtimes, frame, layout.agents);
+    render_jobs_section(app, frame, layout.jobs);
+    render_sidebar_toggle(app, frame, layout.toggle, false, p);
 }
 
 fn resolved_token_spans(
@@ -1573,15 +2357,10 @@ pub(crate) fn expanded_sidebar_toggle_rect(area: Rect) -> Rect {
 fn render_sidebar_toggle(
     app: &AppState,
     frame: &mut Frame,
-    area: Rect,
+    toggle_area: Rect,
     collapsed: bool,
     p: &Palette,
 ) {
-    let toggle_area = if collapsed {
-        collapsed_sidebar_toggle_rect(area)
-    } else {
-        expanded_sidebar_toggle_rect(area)
-    };
     if toggle_area == Rect::default() {
         return;
     }
@@ -2166,11 +2945,11 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal =
             Terminal::new(TestBackend::new(26, 20)).expect("test terminal should initialize");
 
+        let toggle = expanded_sidebar_toggle_rect(area);
         terminal
-            .draw(|frame| render_sidebar_toggle(&app, frame, area, false, &app.palette))
+            .draw(|frame| render_sidebar_toggle(&app, frame, toggle, false, &app.palette))
             .expect("sidebar toggle should render");
 
-        let toggle = expanded_sidebar_toggle_rect(area);
         assert_eq!(
             terminal.backend().buffer()[(toggle.x, toggle.y)].symbol(),
             "«"
@@ -2643,6 +3422,358 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5);
 
         assert_eq!(divider, Rect::default());
+    }
+
+    // --- SidebarLayout: degradation table -----------------------------
+
+    fn jobs_want(content_rows: u16, max_visible_rows: u16) -> JobsSectionWant {
+        JobsSectionWant {
+            enabled: true,
+            content_rows,
+            max_visible_rows,
+        }
+    }
+
+    #[test]
+    fn jobs_disabled_never_allocates_rows() {
+        let allocation = jobs_allocation(JobsSectionWant::hidden(), 30);
+        assert_eq!(allocation, JobsAllocation::NONE);
+    }
+
+    #[test]
+    fn jobs_with_no_content_never_allocates_rows() {
+        let allocation = jobs_allocation(jobs_want(0, 12), 30);
+        assert_eq!(allocation, JobsAllocation::NONE);
+    }
+
+    #[test]
+    fn degradation_table_row_1_exact_fit_gets_full_wanted_rows() {
+        // H - 6 >= wanted => Jobs gets `wanted`, no scrollbar.
+        // content_height = 20 => usable = 19 => usable - 6 = 13 >= wanted(5).
+        let allocation = jobs_allocation(jobs_want(5, 12), 20);
+        assert_eq!(
+            allocation,
+            JobsAllocation {
+                rows: 5,
+                collapsed_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_table_row_1_caps_at_max_visible_rows() {
+        let allocation = jobs_allocation(jobs_want(50, 5), 20);
+        assert_eq!(
+            allocation,
+            JobsAllocation {
+                rows: 5,
+                collapsed_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_table_row_2_squeezes_with_scrollbar() {
+        // 1 <= H - 6 < wanted => Jobs gets H - 6, with a scrollbar.
+        // content_height = 12 => usable = 11 => usable - 6 = 5, wanted = 12.
+        let allocation = jobs_allocation(jobs_want(12, 12), 12);
+        assert_eq!(
+            allocation,
+            JobsAllocation {
+                rows: 5,
+                collapsed_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_table_row_3_collapses_to_one_header_row() {
+        // H - 6 < 1 (but H >= 7, so Jobs isn't fully hidden): one row,
+        // collapsed header only. content_height = 7 => usable = 6.
+        let allocation = jobs_allocation(jobs_want(4, 12), 7);
+        assert_eq!(
+            allocation,
+            JobsAllocation {
+                rows: 1,
+                collapsed_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn degradation_table_row_4_hides_entirely_below_seven_rows() {
+        let allocation = jobs_allocation(jobs_want(4, 12), 6);
+        assert_eq!(allocation, JobsAllocation::NONE);
+
+        // Falls through to today's two-way split -- no toggle row reserved,
+        // no Jobs rect, identical to `expanded_sidebar_sections` directly.
+        let area = Rect::new(0, 0, 26, 6);
+        let layout = compute_expanded_sidebar_layout(area, 0.5, jobs_want(4, 12));
+        let (spaces, agents) = expanded_sidebar_sections(area, 0.5);
+        assert_eq!(layout.jobs, Rect::default());
+        assert_eq!(layout.spaces, spaces);
+        assert_eq!(layout.agents, agents);
+        assert_eq!(layout.toggle, expanded_sidebar_toggle_rect(area));
+    }
+
+    #[test]
+    fn jobs_never_starves_spaces_or_agents_below_three_rows_each_outside_the_row_3_boundary() {
+        // Away from the single contradictory boundary height (content_height
+        // == 7, see `jobs_allocation`'s doc comment), Spaces+Agents always
+        // keep at least 3 rows each once Jobs is showing full rows or a
+        // scrollbar-squeezed count.
+        for content_height in 8u16..=40 {
+            for wanted in 1u16..=20 {
+                let allocation = jobs_allocation(jobs_want(wanted, wanted), content_height);
+                if allocation.rows == 0 {
+                    continue;
+                }
+                let remainder = content_height - 1 - allocation.rows;
+                assert!(
+                    remainder >= 6,
+                    "content_height={content_height} wanted={wanted} allocation={allocation:?} \
+                     left only {remainder} rows for Spaces+Agents"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_layout_toggle_row_always_survives_regardless_of_jobs() {
+        for height in 0u16..=30 {
+            let area = Rect::new(0, 0, 26, height);
+            for jobs in [JobsSectionWant::hidden(), jobs_want(4, 12), jobs_want(20, 20)] {
+                let layout = compute_expanded_sidebar_layout(area, 0.5, jobs);
+                assert_eq!(
+                    layout.toggle,
+                    expanded_sidebar_toggle_rect(area),
+                    "toggle rect must never move, height={height} jobs={jobs:?}"
+                );
+                if layout.toggle != Rect::default() {
+                    assert!(
+                        !rects_overlap(layout.toggle, layout.jobs),
+                        "jobs must never draw under the toggle, height={height}"
+                    );
+                }
+                if layout.jobs != Rect::default() {
+                    // The toggle row is only actually *reserved* out of
+                    // Spaces/Agents once Jobs is genuinely showing; when
+                    // hidden, the toggle stays the pre-existing overlay drawn
+                    // on top of Agents' last row (see `compute_expanded_sidebar_layout`
+                    // doc comment) -- that overlap is intentional there.
+                    assert!(
+                        !rects_overlap(layout.toggle, layout.agents),
+                        "agents must never draw under the toggle once Jobs is reserving it, \
+                         height={height}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_layout_toggle_row_always_survives_regardless_of_jobs() {
+        for height in 0u16..=30 {
+            let area = Rect::new(0, 0, 26, height);
+            for jobs in [JobsSectionWant::hidden(), jobs_want(4, 12), jobs_want(20, 20)] {
+                let layout = compute_collapsed_sidebar_layout(area, jobs);
+                assert_eq!(
+                    layout.toggle,
+                    collapsed_sidebar_toggle_rect(area),
+                    "toggle rect must never move, height={height} jobs={jobs:?}"
+                );
+            }
+        }
+    }
+
+    fn rects_overlap(a: Rect, b: Rect) -> bool {
+        if a == Rect::default() || b == Rect::default() {
+            return false;
+        }
+        a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    }
+
+    #[test]
+    fn expanded_layout_handles_tiny_heights_without_panicking() {
+        for height in 0u16..=10 {
+            for width in 0u16..=4 {
+                let area = Rect::new(0, 0, width, height);
+                for jobs in [JobsSectionWant::hidden(), jobs_want(4, 12)] {
+                    // Must not panic (saturating arithmetic throughout).
+                    let _ = compute_expanded_sidebar_layout(area, 0.5, jobs);
+                    let _ = compute_collapsed_sidebar_layout(area, jobs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_layout_never_allocates_jobs_in_a_bordered_out_sidebar() {
+        // width <= 1 leaves no content column at all (matches
+        // `expanded_sidebar_sections`'s own guard), so Jobs must not show
+        // even when it has plenty of height and content to draw.
+        for width in 0u16..=1 {
+            let area = Rect::new(0, 0, width, 30);
+            let layout = compute_expanded_sidebar_layout(area, 0.5, jobs_want(4, 12));
+            assert_eq!(layout.jobs, Rect::default());
+        }
+    }
+
+    #[test]
+    fn expanded_and_collapsed_carves_are_not_symmetric() {
+        // Same area, same Jobs want: the two carves must not coincidentally
+        // agree, since collapsed ignores split_ratio and uses a fixed half
+        // split while expanded honours it -- this pins that they really are
+        // two independent code paths rather than one reusing the other.
+        let area = Rect::new(0, 0, 26, 20);
+        let jobs = jobs_want(4, 12);
+        let expanded = compute_expanded_sidebar_layout(area, 0.9, jobs);
+        let collapsed = compute_collapsed_sidebar_layout(area, jobs);
+        assert_ne!(expanded.spaces, collapsed.spaces);
+    }
+
+    // --- SidebarLayout: divider drag round trip -----------------------
+
+    #[test]
+    fn divider_drag_round_trip_matches_render_with_jobs_allocated() {
+        let area = Rect::new(0, 0, 26, 30);
+        let jobs = jobs_want(4, 12);
+        let target_ratio = 0.4_f32;
+        let layout = compute_expanded_sidebar_layout(area, target_ratio, jobs);
+        assert!(
+            layout.jobs.height > 0,
+            "jobs should be allocated for this test to be meaningful"
+        );
+        let divider_row = layout
+            .section_divider_y
+            .expect("divider should exist at this size");
+        let remainder = Rect::new(
+            layout.spaces.x,
+            layout.spaces.y,
+            layout.spaces.width,
+            layout.spaces.height + layout.agents.height,
+        );
+
+        let ratio = sidebar_section_ratio_for_row(remainder, divider_row)
+            .expect("remainder is tall enough to convert a row back into a ratio");
+        let re_layout = compute_expanded_sidebar_layout(area, ratio, jobs);
+
+        assert_eq!(re_layout.section_divider_y, Some(divider_row));
+        assert_eq!(
+            re_layout.jobs, layout.jobs,
+            "the ratio round trip must not disturb Jobs' allocation"
+        );
+    }
+
+    // --- SidebarLayout: render/hit-test agreement ---------------------
+    //
+    // The regression this refactor exists to prevent: rendering and
+    // hit-testing carving the sidebar with two different formulas so a click
+    // lands on the wrong row. Every consumer in this codebase (render_sidebar,
+    // render_sidebar_collapsed and every `AppState` hit-test helper in
+    // `app::input::sidebar`) is wired to call `compute_expanded_sidebar_layout`
+    // / `compute_collapsed_sidebar_layout` / `compute_sidebar_layout` --
+    // never to recompute the allocation order some other way. This test
+    // exercises that shared entry point across a range of sizes and asserts
+    // the pieces it hands back always tile the sidebar with no gaps and no
+    // overlaps, for both carves and across the whole Jobs degradation table.
+    #[test]
+    fn render_and_hit_test_geometry_tile_the_sidebar_with_no_gaps_or_overlaps() {
+        for width in [0u16, 1, 2, 4, 10, 26] {
+            for height in 0u16..=40 {
+                let area = Rect::new(3, 5, width, height);
+                for jobs in [
+                    JobsSectionWant::hidden(),
+                    jobs_want(1, 12),
+                    jobs_want(4, 12),
+                    jobs_want(12, 12),
+                    jobs_want(40, 12),
+                ] {
+                    for (layout, label) in [
+                        (
+                            compute_expanded_sidebar_layout(area, 0.5, jobs),
+                            "expanded",
+                        ),
+                        (compute_collapsed_sidebar_layout(area, jobs), "collapsed"),
+                    ] {
+                        assert!(
+                            !rects_overlap(layout.spaces, layout.agents),
+                            "{label}: spaces/agents overlap at {area:?} jobs={jobs:?}"
+                        );
+                        assert!(
+                            !rects_overlap(layout.spaces, layout.jobs),
+                            "{label}: spaces/jobs overlap at {area:?} jobs={jobs:?}"
+                        );
+                        assert!(
+                            !rects_overlap(layout.agents, layout.jobs),
+                            "{label}: agents/jobs overlap at {area:?} jobs={jobs:?}"
+                        );
+                        assert!(
+                            !rects_overlap(layout.jobs, layout.toggle),
+                            "{label}: jobs/toggle overlap at {area:?} jobs={jobs:?}"
+                        );
+                        // The toggle row is only actually carved out of
+                        // Spaces/Agents once Jobs is genuinely showing (see
+                        // `compute_expanded_sidebar_layout`'s doc comment):
+                        // when Jobs is hidden the toggle is the pre-existing
+                        // overlay drawn on top of whatever's underneath,
+                        // which can be Spaces or Agents at very small sizes.
+                        // That overlap is intentional/unchanged there.
+                        if layout.jobs != Rect::default() {
+                            assert!(
+                                !rects_overlap(layout.spaces, layout.toggle),
+                                "{label}: spaces/toggle overlap at {area:?} jobs={jobs:?}"
+                            );
+                            assert!(
+                                !rects_overlap(layout.agents, layout.toggle),
+                                "{label}: agents/toggle overlap at {area:?} jobs={jobs:?}"
+                            );
+                        }
+                        // Expanded stacks Spaces directly above Agents (the
+                        // divider is drawn as an overlay on Agents' first
+                        // row); collapsed reserves a separate divider row
+                        // between them (`collapsed_sidebar_sections`), so
+                        // only expanded is adjacent with no gap.
+                        if label == "expanded"
+                            && layout.spaces != Rect::default()
+                            && layout.agents != Rect::default()
+                        {
+                            assert_eq!(
+                                layout.spaces.y + layout.spaces.height,
+                                layout.agents.y,
+                                "{label}: spaces/agents must be adjacent at {area:?} jobs={jobs:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regression_with_jobs_disabled_matches_pre_jobs_geometry_at_every_size() {
+        // The regression bar: with Jobs hidden, `compute_sidebar_layout`
+        // reproduces the exact pre-Jobs two-way geometry at every size, for
+        // both the expanded and collapsed carve.
+        for width in 0u16..=30 {
+            for height in 0u16..=30 {
+                let area = Rect::new(0, 0, width, height);
+                let expanded = compute_expanded_sidebar_layout(area, 0.5, JobsSectionWant::hidden());
+                let (spaces, agents) = expanded_sidebar_sections(area, 0.5);
+                assert_eq!(expanded.spaces, spaces);
+                assert_eq!(expanded.agents, agents);
+                assert_eq!(expanded.toggle, expanded_sidebar_toggle_rect(area));
+                assert_eq!(expanded.jobs, Rect::default());
+
+                let collapsed = compute_collapsed_sidebar_layout(area, JobsSectionWant::hidden());
+                let (c_spaces, c_divider, c_agents) = collapsed_sidebar_sections(area);
+                assert_eq!(collapsed.spaces, c_spaces);
+                assert_eq!(collapsed.agents, c_agents);
+                assert_eq!(collapsed.section_divider_y, c_divider);
+                assert_eq!(collapsed.toggle, collapsed_sidebar_toggle_rect(area));
+                assert_eq!(collapsed.jobs, Rect::default());
+            }
+        }
     }
 
     #[test]
@@ -3174,5 +4305,321 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 },
             ]
         );
+    }
+
+    // --- Jobs section rendering ---------------------------------------
+
+    fn sample_row(id: &str, cells: &[&str], style: RowStyle) -> ParsedRow {
+        ParsedRow {
+            id: id.to_string(),
+            cells: cells.iter().map(|cell| cell.to_string()).collect(),
+            style,
+            vars: std::collections::BTreeMap::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn jobs_app(groups: Vec<ParsedGroup>) -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        app.sidebar_list = crate::config::ListSectionConfig {
+            enabled: true,
+            ..crate::config::ListSectionConfig::default()
+        };
+        app.jobs = JobsSectionState {
+            title: Some("JOBS".to_string()),
+            summary: Some("2R 1Q".to_string()),
+            groups,
+            mode: "live".to_string(),
+            collapsed: false,
+            ..JobsSectionState::default()
+        };
+        app
+    }
+
+    #[test]
+    fn jobs_disabled_by_default_in_test_new_matches_the_regression_bar() {
+        // `AppState::test_new` deliberately disables Jobs (see its comment) so
+        // every pre-existing sidebar test built on it keeps observing today's
+        // Jobs-less layout -- the design doc's literal regression bar.
+        let app = AppState::test_new();
+        assert!(!app.sidebar_list.enabled);
+        assert_eq!(jobs_section_want(&app), JobsSectionWant::hidden());
+    }
+
+    #[test]
+    fn jobs_stays_hidden_until_the_poller_produces_a_result_even_if_enabled() {
+        // A fresh `App::new` with default config has `sidebar_list.enabled ==
+        // true` (the config's shipped default) but no poller yet to populate
+        // `AppState::jobs` -- this must not put a permanently-empty header
+        // into every sidebar (and, concretely, must not shift the geometry
+        // pre-existing mouse/layout tests hardcode coordinates against).
+        let mut app = AppState::test_new();
+        app.sidebar_list.enabled = true;
+        assert_eq!(jobs_section_want(&app), JobsSectionWant::hidden());
+    }
+
+    #[test]
+    fn jobs_content_rows_counts_header_group_headers_and_visible_rows() {
+        let state = JobsSectionState {
+            collapsed: false,
+            groups: vec![
+                ParsedGroup {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    rows: vec![sample_row("1", &["a"], RowStyle::Normal)],
+                },
+                ParsedGroup {
+                    id: "queued".into(),
+                    label: "Queued".into(),
+                    rows: vec![],
+                },
+            ],
+            ..JobsSectionState::default()
+        };
+        // header + running-header + running-row + queued-header
+        assert_eq!(jobs_content_rows(&state), 4);
+    }
+
+    #[test]
+    fn jobs_content_rows_is_one_when_the_section_is_collapsed() {
+        let state = JobsSectionState {
+            collapsed: true,
+            groups: vec![ParsedGroup {
+                id: "running".into(),
+                label: "Running".into(),
+                rows: vec![sample_row("1", &["a"], RowStyle::Normal)],
+            }],
+            ..JobsSectionState::default()
+        };
+        assert_eq!(jobs_content_rows(&state), 1);
+    }
+
+    #[test]
+    fn jobs_content_rows_skips_rows_of_an_individually_collapsed_group() {
+        let mut state = JobsSectionState {
+            collapsed: false,
+            groups: vec![ParsedGroup {
+                id: "running".into(),
+                label: "Running".into(),
+                rows: vec![
+                    sample_row("1", &["a"], RowStyle::Normal),
+                    sample_row("2", &["b"], RowStyle::Normal),
+                ],
+            }],
+            ..JobsSectionState::default()
+        };
+        state.collapsed_group_ids.insert("running".to_string());
+        // header + the group's own header, rows excluded.
+        assert_eq!(jobs_content_rows(&state), 2);
+    }
+
+    #[test]
+    fn jobs_column_rects_splits_fill_and_fixed_columns_with_single_column_gaps() {
+        let columns = crate::config::ListSectionConfig::default().columns;
+        let rects = jobs_column_rects(Rect::new(0, 0, 24, 1), &columns);
+        assert_eq!(
+            rects,
+            vec![
+                Rect::new(0, 0, 12, 1),
+                Rect::new(13, 0, 3, 1),
+                Rect::new(17, 0, 7, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn jobs_column_rects_shrinks_gracefully_when_too_narrow() {
+        let columns = crate::config::ListSectionConfig::default().columns;
+        let rects = jobs_column_rects(Rect::new(0, 0, 4, 1), &columns);
+        assert_eq!(rects.len(), 3);
+        for rect in rects {
+            assert!(rect.x + rect.width <= 4);
+        }
+    }
+
+    #[test]
+    fn jobs_rect_respects_the_reserved_border_column_like_spaces_and_agents() {
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_expanded_sidebar_layout(area, 0.5, jobs_want(4, 12));
+        assert!(layout.jobs.height > 0, "jobs should be allocated");
+        let border_x = area.x + area.width - 1;
+        assert!(layout.jobs.x + layout.jobs.width <= border_x);
+        assert_eq!(layout.jobs.width, layout.spaces.width);
+    }
+
+    #[test]
+    fn jobs_header_shows_chevron_title_and_summary_when_collapsed() {
+        let mut app = jobs_app(vec![]);
+        app.jobs.collapsed = true;
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
+        assert_eq!(layout.jobs.height, 1);
+        let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
+        assert!(text.contains("JOBS"), "header text was {text:?}");
+        assert!(text.contains("2R 1Q"), "header text was {text:?}");
+        assert_eq!(buffer[(layout.jobs.x, layout.jobs.y)].symbol(), "▸");
+    }
+
+    #[test]
+    fn jobs_header_shows_mode_toggle_when_expanded_with_room_for_a_body() {
+        let group = ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows: vec![sample_row("1", &["ued", "4N", "1:23:45"], RowStyle::Normal)],
+        };
+        let app = jobs_app(vec![group]);
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
+        assert!(layout.jobs.height > 1, "expected room for a body below the header");
+        let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
+        assert!(text.contains("[live|history]"), "header text was {text:?}");
+        assert_eq!(buffer[(layout.jobs.x, layout.jobs.y)].symbol(), "▾");
+    }
+
+    #[test]
+    fn jobs_header_shows_stale_indicator_and_last_success_label_over_the_mode_toggle() {
+        let mut app = jobs_app(vec![ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows: vec![sample_row("1", &["ued", "4N", "1:23:45"], RowStyle::Normal)],
+        }]);
+        app.jobs.is_stale = true;
+        app.jobs.last_success_label = Some("5m ago".to_string());
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
+        let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
+        assert!(text.contains("stale"), "header text was {text:?}");
+        assert!(text.contains("5m ago"), "header text was {text:?}");
+        assert!(!text.contains("[live|history]"), "header text was {text:?}");
+    }
+
+    #[test]
+    fn jobs_group_header_and_row_render_at_their_own_hit_rects() {
+        let rows: Vec<ParsedRow> = (0..10)
+            .map(|index| {
+                sample_row(
+                    &index.to_string(),
+                    &[&format!("job{index}"), "1N", "0:01:00"],
+                    RowStyle::Ok,
+                )
+            })
+            .collect();
+        let group = ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows,
+        };
+        let mut app = jobs_app(vec![group]);
+        app.sidebar_list.max_visible_rows = 6;
+        let area = Rect::new(0, 0, 26, 20);
+
+        let layout = compute_sidebar_layout(&app, area);
+        assert!(
+            layout.jobs_scrollbar.is_some(),
+            "ten rows under a cap of six should need a scrollbar"
+        );
+        assert!(layout.jobs_rows.len() >= 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let header_hit = &layout.jobs_rows[0];
+        assert_eq!(
+            header_hit.row_id, header_hit.group_id,
+            "a group header's row_id equals its group_id by convention"
+        );
+        assert!(row_text(buffer, header_hit.rect.y, area.width).contains("Running"));
+
+        for hit in &layout.jobs_rows[1..] {
+            assert_ne!(hit.row_id, hit.group_id);
+            let expected = format!("job{}", hit.row_id);
+            assert!(
+                row_text(buffer, hit.rect.y, area.width).contains(&expected),
+                "row {} rect {:?} did not draw its own content",
+                hit.row_id,
+                hit.rect
+            );
+        }
+
+        let scrollbar = layout.jobs_scrollbar.unwrap();
+        for y in scrollbar.y..scrollbar.y + scrollbar.height {
+            assert_eq!(buffer[(scrollbar.x, y)].symbol(), "▕");
+        }
+    }
+
+    #[test]
+    fn jobs_row_style_is_resolved_from_config_styles_by_name() {
+        let group = ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows: vec![sample_row("1", &["ued", "4N", "1:23"], RowStyle::Fail)],
+        };
+        let app = jobs_app(vec![group]);
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_sidebar_layout(&app, area);
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id == "1")
+            .expect("row should be visible");
+
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let expected_fg = crate::config::ListSectionConfig::default().styles["fail"].ratatui();
+        let cell = &buffer[(row_hit.rect.x, row_hit.rect.y)];
+        assert_eq!(cell.style().fg, Some(expected_fg));
+    }
+
+    #[test]
+    fn jobs_row_alignment_matches_column_spec() {
+        let group = ParsedGroup {
+            id: "running".into(),
+            label: "Running".into(),
+            rows: vec![sample_row("1", &["ued", "4N", "1:23"], RowStyle::Normal)],
+        };
+        let app = jobs_app(vec![group]);
+        let area = Rect::new(0, 0, 26, 20);
+        let layout = compute_sidebar_layout(&app, area);
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id == "1")
+            .expect("row should be visible");
+
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let columns = jobs_column_rects(row_hit.rect, &crate::config::ListSectionConfig::default().columns);
+        // Right-aligned "4N" in a 3-wide column is padded on the left.
+        let nodes_col = columns[1];
+        let text = row_text(buffer, nodes_col.y, nodes_col.x + nodes_col.width);
+        assert!(text.ends_with("4N"));
     }
 }

@@ -1013,6 +1013,12 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.deferred_worktree_submit");
         }
 
+        if self.app.state.request_submit_list_action {
+            self.app.state.request_submit_list_action = false;
+            self.app.submit_list_action_confirm();
+            needs_render = true;
+        }
+
         if self.app.state.request_reload_config {
             self.app.state.request_reload_config = false;
             self.reload_server_config(true);
@@ -1292,6 +1298,8 @@ impl HeadlessServer {
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            self.app.state.jobs.collapsed,
+            self.app.state.jobs.mode.clone(),
         );
 
         let mut handoff_entries = Vec::new();
@@ -4737,6 +4745,9 @@ impl HeadlessServer {
             self.app.state.toast = None;
             changed = true;
         }
+        // Design doc: "Notifications" -- refills the toast slot from the
+        // queued Jobs provider notifications as it frees.
+        changed |= self.app.drain_list_notify_queue();
 
         if self
             .app
@@ -4780,6 +4791,9 @@ impl HeadlessServer {
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
+            // Jobs polling follows the same gate as git refresh (design doc:
+            // "no TUI client attached, no polling").
+            self.app.start_list_poll_if_due(now);
         }
 
         if self
@@ -4835,6 +4849,11 @@ impl HeadlessServer {
         }
         info!("server shutdown initiated");
         self.shutting_down = true;
+
+        // Shutdown cancellation: the generic child tracker never kills
+        // children on exit (design doc: "Shutdown cancellation"), so an
+        // in-flight list-section poll needs its own explicit kill here.
+        self.app.shutdown_list_poll();
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();

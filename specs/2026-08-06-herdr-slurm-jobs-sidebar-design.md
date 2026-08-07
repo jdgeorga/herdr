@@ -82,7 +82,14 @@ SLURM knowledge.
 buffer, the sacct exit-code lookup, history mode, and when to notify.
 
 Interpreter: bare `python3` on NERSC login nodes is **3.6.15**. Invoke
-`/usr/bin/python3.11` (verified 3.11.15) by absolute path.
+`/usr/bin/python3.11` (verified 3.11.15) by absolute path, with `-I -S`.
+
+The flags are not optional. Python startup runs `sitecustomize` and user-site
+code *before* `main()`, and anything that prints there lands on stdout ahead of
+the JSON, breaking the contract that stdout is only ever one JSON object. `-I`
+(isolated) and `-S` (no site) close that. Because herdr executes
+`python3.11 <script>` rather than exec'ing the file, the shebang alone is not
+enough — the flags must appear in the configured `command` array.
 
 ## Layout — one source of truth
 
@@ -377,7 +384,7 @@ collapsed = true
 refresh_seconds = 10
 timeout_seconds = 5
 max_visible_rows = 12
-command = ["/usr/bin/python3.11", "~/.config/herdr/scripts/herdr-jobs.py", "--mode", "{mode}"]
+command = ["/usr/bin/python3.11", "-I", "-S", "~/.config/herdr/scripts/herdr-jobs.py", "--mode", "{mode}"]
 modes = ["live", "history"]
 
 columns = [
@@ -436,23 +443,46 @@ expanding must be a one-time act.
 ## SLURM provider behaviour
 
 ```
-squeue -u $USER -h -o '%i|%j|%t|%P|%q|%D|%M|%L|%l|%S|%r|%Z|%o|%e'
+squeue -u $USER --json
 ```
 
-Measured ~35 ms. `%i` id, `%j` name, `%t` state, `%P` partition, `%q` QOS,
-`%D` nodes, `%M` elapsed, `%L` time left, `%l` limit, `%S` start, `%r` reason,
-`%Z` workdir, `%o`/`%e` stdout/stderr paths.
+**Not** the pipe-delimited `-o '%i|%j|...'` form. Job names and work directories
+are user-controlled and may contain `|`, which shifts every subsequent field and
+makes the row silently unparseable — it disappears from the sidebar with no
+error. Measured: `squeue --json` runs in **49 ms**, no slower than the text form,
+so there is no reason to accept the fragility.
 
-Grouping by `%t`: `R` → Running (show `%L`), `PD` → Queued (show `%l`).
+Schema notes, verified against SLURM 25.11.6 on Perlmutter: numeric fields are
+`{"set": bool, "infinite": bool, "number": N}` objects, not scalars; `job_state`
+is a list; `standard_output`/`standard_error` are direct fields. Durations are
+converted to the same display strings as before — `H:MM:SS`, `D-HH:MM:SS` past
+24 hours, `UNLIMITED` — since those are what the row renders.
 
-Time fields are pre-formatted strings. They gain a `D-` prefix past 24 hours and
-can be `UNLIMITED` or `N/A`. Do not assume `HH:MM:SS`.
+Grouping is by state: `RUNNING` → Running (time remaining), `PENDING` → Queued
+(time requested).
 
-The directory label is the last one or two components of `%Z`; no `~`-collapse
-helper exists in the codebase for subpaths, so the provider does it.
+For history, `sacct --json` took **6.9 s** for 1092 jobs — too close to the 5 s
+timeout to be safe. `sacct --json -X` (excluding job steps, which this path does
+not want anyway) takes **0.5 s**. Use `-X`. The single-job vanish-transition
+lookup stays on `--format=State,ExitCode -P`, whose two fields cannot contain
+`|`.
 
-`%o`/`%e` are unresolved templates (`slurm-%j.out`) for pending jobs, so `tail`
-is omitted from `actions` on pending rows and the menu item is hidden.
+The directory label is the last one or two components of the work directory; no
+`~`-collapse helper exists in the codebase for subpaths, so the provider does it.
+
+### When `tail` is offered
+
+Rev 1 said `%o` is resolved for running jobs and templated for pending ones.
+That is wrong: it depends on job *type*, not job state. Observed live —
+
+- interactive/`no-shell` allocations are `RUNNING` with `standard_output: ""` —
+  no log file exists at all
+- a `PENDING` batch job carries `/path/logs/%x.%j.out` — a real path, but with
+  unresolved `%x`/`%j` templates
+
+So the rule is: offer `tail` only when the path is non-empty and contains no `%`
+template character. That covers ordinary batch jobs, which is the case that
+matters, and correctly declines both edge cases above.
 
 ### Linger, history, notifications
 

@@ -57,6 +57,12 @@ pub(super) enum MouseAction {
     },
     RenameModal(ModalAction),
     ConfirmCloseAccept,
+    /// The Jobs header mode toggle was clicked (design doc mouse contract:
+    /// "cycle `live` <-> `history`, immediate re-poll"). `AppState::handle_mouse`
+    /// already applied the mode change; this only carries the "immediate
+    /// re-poll" half up to `App`, since the poll scheduling fields
+    /// (`last_list_poll` et al.) live there, not on `AppState`.
+    JobsModeToggled,
     ContextMenu {
         menu: ContextMenuState,
         idx: usize,
@@ -215,7 +221,10 @@ impl AppState {
 
         if matches!(
             self.mode,
-            Mode::NewLinkedWorktree | Mode::OpenExistingWorktree | Mode::ConfirmRemoveWorktree
+            Mode::NewLinkedWorktree
+                | Mode::OpenExistingWorktree
+                | Mode::ConfirmRemoveWorktree
+                | Mode::ConfirmListAction
         ) && !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return None;
@@ -389,6 +398,44 @@ impl AppState {
                     return None;
                 }
 
+                if self.mode == Mode::ConfirmListAction {
+                    if let Some(popup) =
+                        crate::ui::list_action_confirm_popup_rect(self.screen_rect())
+                    {
+                        let inner = Rect::new(
+                            popup.x + 1,
+                            popup.y + 1,
+                            popup.width.saturating_sub(2),
+                            popup.height.saturating_sub(2),
+                        );
+                        let (confirm, cancel) =
+                            crate::ui::list_action_confirm_button_rects(inner);
+                        match modal_action_from_buttons(
+                            mouse.column,
+                            mouse.row,
+                            &[
+                                (confirm, ModalAction::Confirm),
+                                (cancel, ModalAction::Cancel),
+                            ],
+                        ) {
+                            Some(ModalAction::Confirm) => {
+                                self.request_submit_list_action = true;
+                            }
+                            Some(ModalAction::Cancel)
+                                if !self
+                                    .list_action_confirm
+                                    .as_ref()
+                                    .is_some_and(|confirm| confirm.in_progress) =>
+                            {
+                                self.list_action_confirm = None;
+                                leave_modal(self);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return None;
+                }
+
                 if matches!(
                     self.mode,
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane
@@ -523,6 +570,42 @@ impl AppState {
                 if in_sidebar {
                     if self.on_sidebar_toggle(mouse.column, mouse.row) {
                         self.sidebar_collapsed = !self.sidebar_collapsed;
+                        return None;
+                    }
+
+                    // Jobs sits at the bottom of both the expanded and
+                    // collapsed sidebar layouts, above the toggle row (design
+                    // doc's mouse contract: this must be checked before
+                    // Spaces/Agents/the collapsed workspace list, all of
+                    // which otherwise assume every sidebar click belongs to
+                    // them).
+                    if self.jobs_hit(mouse.column, mouse.row) {
+                        if let Some(target) = self.jobs_scrollbar_target_at(mouse.column, mouse.row)
+                        {
+                            match target {
+                                ScrollbarClickTarget::Thumb { grab_row_offset } => {
+                                    self.drag = Some(DragState {
+                                        target: DragTarget::JobsScrollbar { grab_row_offset },
+                                    });
+                                }
+                                ScrollbarClickTarget::Track { offset_from_bottom } => {
+                                    self.set_jobs_offset_from_bottom(offset_from_bottom);
+                                }
+                            }
+                        } else if self.jobs_header_chevron_hit(mouse.column, mouse.row) {
+                            self.toggle_jobs_collapsed();
+                        } else if self.jobs_mode_toggle_hit(mouse.column, mouse.row) {
+                            self.cycle_jobs_mode();
+                            return Some(MouseAction::JobsModeToggled);
+                        } else if let Some(hit) =
+                            self.jobs_row_hit_at(mouse.column, mouse.row)
+                        {
+                            if hit.row_id == hit.group_id {
+                                self.toggle_jobs_group_collapsed(&hit.group_id);
+                            } else {
+                                self.select_jobs_row(&hit.row_id);
+                            }
+                        }
                         return None;
                     }
 
@@ -771,6 +854,13 @@ impl AppState {
                                 self.set_agent_panel_offset_from_bottom(offset_from_bottom);
                             }
                         }
+                        DragTarget::JobsScrollbar { grab_row_offset } => {
+                            if let Some(offset_from_bottom) =
+                                self.jobs_offset_for_drag_row(mouse.row, *grab_row_offset)
+                            {
+                                self.set_jobs_offset_from_bottom(offset_from_bottom);
+                            }
+                        }
                         DragTarget::PaneSplit {
                             path,
                             direction,
@@ -984,11 +1074,21 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
+                let jobs_area = self.sidebar_layout().jobs;
+                let over_jobs = jobs_area != Rect::default()
+                    && mouse.row >= jobs_area.y
+                    && mouse.row < jobs_area.y + jobs_area.height;
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
                     && mouse.row < agent_area.y + agent_area.height;
-                if over_agent_panel {
+                if over_jobs {
+                    if crate::ui::should_show_scrollbar(crate::ui::jobs_list_scroll_metrics(
+                        self, jobs_area,
+                    )) {
+                        self.scroll_jobs(-1);
+                    }
+                } else if over_agent_panel {
                     if crate::ui::should_show_scrollbar(crate::ui::agent_panel_scroll_metrics(
                         self, agent_area,
                     )) {
@@ -1003,11 +1103,21 @@ impl AppState {
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
+                let jobs_area = self.sidebar_layout().jobs;
+                let over_jobs = jobs_area != Rect::default()
+                    && mouse.row >= jobs_area.y
+                    && mouse.row < jobs_area.y + jobs_area.height;
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
                     && mouse.row < agent_area.y + agent_area.height;
-                if over_agent_panel {
+                if over_jobs {
+                    if crate::ui::should_show_scrollbar(crate::ui::jobs_list_scroll_metrics(
+                        self, jobs_area,
+                    )) {
+                        self.scroll_jobs(1);
+                    }
+                } else if over_agent_panel {
                     if crate::ui::should_show_scrollbar(crate::ui::agent_panel_scroll_metrics(
                         self, agent_area,
                     )) {
@@ -1037,6 +1147,28 @@ impl AppState {
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
                 self.clear_chrome_press(source_id);
+                // Design doc mouse contract: right click on a job row opens
+                // its context menu, checked before this falls through to
+                // treating the click as a workspace right-click.
+                if self.jobs_hit(mouse.column, mouse.row) {
+                    if let Some(hit) = self.jobs_row_hit_at(mouse.column, mouse.row) {
+                        if hit.row_id != hit.group_id {
+                            let can_tail = self.jobs_row_can_tail(&hit.row_id);
+                            self.context_menu = Some(ContextMenuState {
+                                kind: ContextMenuKind::Job {
+                                    row_id: hit.row_id,
+                                    can_tail,
+                                },
+                                x: mouse.column,
+                                y: mouse.row,
+                                list: MenuListState::new(0),
+                            });
+                            self.mode = Mode::ContextMenu;
+                        }
+                    }
+                    return None;
+                }
+
                 if self
                     .workspace_list_scrollbar_target_at(mouse.column, mouse.row)
                     .is_some()
@@ -4774,5 +4906,357 @@ mod tests {
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::HostScroll);
+    }
+
+    // --- Jobs mouse contract -------------------------------------------
+
+    fn app_with_jobs(sidebar_collapsed: bool) -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_collapsed = sidebar_collapsed;
+        if sidebar_collapsed {
+            app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
+            app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+        }
+        app.state.sidebar_list = crate::config::ListSectionConfig {
+            enabled: true,
+            ..crate::config::ListSectionConfig::default()
+        };
+        app.state.jobs = crate::app::state::JobsSectionState {
+            title: Some("JOBS".to_string()),
+            summary: Some("1R".to_string()),
+            groups: vec![crate::list_section::protocol::ParsedGroup {
+                id: "running".to_string(),
+                label: "Running".to_string(),
+                rows: vec![crate::list_section::protocol::ParsedRow {
+                    id: "123".to_string(),
+                    cells: vec!["ued".to_string()],
+                    style: crate::list_section::protocol::RowStyle::Normal,
+                    vars: Default::default(),
+                    actions: vec!["cancel".to_string(), "tail".to_string()],
+                }],
+            }],
+            mode: "live".to_string(),
+            collapsed: false,
+            ..crate::app::state::JobsSectionState::default()
+        };
+        app
+    }
+
+    fn app_with_scrollable_jobs() -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_list = crate::config::ListSectionConfig {
+            enabled: true,
+            max_visible_rows: 3,
+            ..crate::config::ListSectionConfig::default()
+        };
+        let rows = (0..10)
+            .map(|i| crate::list_section::protocol::ParsedRow {
+                id: i.to_string(),
+                cells: vec!["a".to_string()],
+                style: crate::list_section::protocol::RowStyle::Normal,
+                vars: Default::default(),
+                actions: Vec::new(),
+            })
+            .collect();
+        app.state.jobs = crate::app::state::JobsSectionState {
+            title: Some("JOBS".to_string()),
+            summary: Some("10R".to_string()),
+            groups: vec![crate::list_section::protocol::ParsedGroup {
+                id: "running".to_string(),
+                label: "Running".to_string(),
+                rows,
+            }],
+            mode: "live".to_string(),
+            collapsed: false,
+            ..crate::app::state::JobsSectionState::default()
+        };
+        app
+    }
+
+    #[test]
+    fn click_one_row_above_jobs_rect_does_not_reach_jobs_when_expanded() {
+        let mut app = app_with_jobs(false);
+        let jobs = app.state.sidebar_layout().jobs;
+        assert!(jobs.height > 0, "jobs should be visible");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            jobs.x,
+            jobs.y - 1,
+        ));
+
+        assert!(!app.state.jobs.collapsed);
+        assert!(app.state.jobs.collapsed_group_ids.is_empty());
+        assert_eq!(app.state.jobs.selected_row_id, None);
+    }
+
+    #[test]
+    fn click_one_row_below_jobs_rect_hits_the_sidebar_toggle_when_expanded() {
+        let mut app = app_with_jobs(false);
+        let jobs = app.state.sidebar_layout().jobs;
+        let toggle = app.state.sidebar_layout().toggle;
+        assert_eq!(
+            jobs.y + jobs.height,
+            toggle.y,
+            "jobs should sit directly above the toggle row"
+        );
+        assert!(!app.state.sidebar_collapsed);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            jobs.y + jobs.height,
+        ));
+
+        assert!(app.state.sidebar_collapsed);
+        assert!(
+            !app.state.jobs.collapsed,
+            "a click on the toggle row must not touch the jobs section"
+        );
+    }
+
+    #[test]
+    fn click_one_row_above_jobs_rect_does_not_reach_jobs_when_collapsed() {
+        let mut app = app_with_jobs(true);
+        let jobs = app.state.sidebar_layout().jobs;
+        assert!(
+            jobs.height > 0,
+            "jobs should still be visible in the collapsed sidebar"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            jobs.x,
+            jobs.y - 1,
+        ));
+
+        assert!(!app.state.jobs.collapsed);
+        assert_eq!(app.state.jobs.selected_row_id, None);
+    }
+
+    #[test]
+    fn click_one_row_below_jobs_rect_hits_the_sidebar_toggle_when_collapsed() {
+        let mut app = app_with_jobs(true);
+        let jobs = app.state.sidebar_layout().jobs;
+        let toggle = app.state.sidebar_layout().toggle;
+        assert_eq!(
+            jobs.y + jobs.height,
+            toggle.y,
+            "jobs should sit directly above the toggle row"
+        );
+        assert!(app.state.sidebar_collapsed);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            jobs.y + jobs.height,
+        ));
+
+        assert!(!app.state.sidebar_collapsed);
+        assert!(!app.state.jobs.collapsed);
+    }
+
+    #[test]
+    fn jobs_header_chevron_click_toggles_collapsed() {
+        let mut app = app_with_jobs(false);
+        let jobs = app.state.sidebar_layout().jobs;
+        assert!(!app.state.jobs.collapsed);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), jobs.x, jobs.y));
+
+        assert!(app.state.jobs.collapsed);
+    }
+
+    #[test]
+    fn jobs_mode_toggle_click_cycles_mode_and_forces_a_repoll() {
+        let mut app = app_with_jobs(false);
+        let hits = app.state.sidebar_layout().jobs_header_hits;
+        assert!(
+            hits.mode_toggle.width > 0,
+            "expected a mode toggle with two configured modes"
+        );
+        assert_eq!(app.state.jobs.mode, "live");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            hits.mode_toggle.x,
+            hits.mode_toggle.y,
+        ));
+
+        assert_eq!(app.state.jobs.mode, "history");
+        assert!(app
+            .list_poll_deadline()
+            .is_some_and(|deadline| deadline <= std::time::Instant::now()));
+    }
+
+    #[test]
+    fn jobs_group_header_click_toggles_that_group() {
+        let mut app = app_with_jobs(false);
+        // Collapsing the group changes the section's content row count, which
+        // shifts `jobs_rect` (and everything inside it) since Jobs is carved
+        // from the bottom of the sidebar -- re-read the hit rect after each
+        // click rather than reusing coordinates computed before the state
+        // change.
+        let group_header_hit = |app: &crate::app::App| {
+            app.state
+                .sidebar_layout()
+                .jobs_rows
+                .iter()
+                .find(|hit| hit.row_id == hit.group_id)
+                .expect("group header row")
+                .clone()
+        };
+
+        let first = group_header_hit(&app);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first.rect.x,
+            first.rect.y,
+        ));
+        assert!(app.state.jobs.collapsed_group_ids.contains("running"));
+
+        let second = group_header_hit(&app);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second.rect.x,
+            second.rect.y,
+        ));
+        assert!(!app.state.jobs.collapsed_group_ids.contains("running"));
+    }
+
+    #[test]
+    fn jobs_row_click_selects_it_by_id() {
+        let mut app = app_with_jobs(false);
+        let layout = app.state.sidebar_layout();
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id != hit.group_id)
+            .expect("job row");
+        let (x, y) = (row_hit.rect.x, row_hit.rect.y);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+
+        assert_eq!(app.state.jobs.selected_row_id.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn right_click_job_row_opens_context_menu_with_tail_when_actionable() {
+        let mut app = app_with_jobs(false);
+        let layout = app.state.sidebar_layout();
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id != hit.group_id)
+            .expect("job row")
+            .clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row_hit.rect.x,
+            row_hit.rect.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().expect("context menu open");
+        assert_eq!(
+            menu.kind,
+            ContextMenuKind::Job {
+                row_id: "123".to_string(),
+                can_tail: true,
+            }
+        );
+        assert_eq!(menu.items(), &["Cancel job", "Tail log", "Copy job ID"]);
+    }
+
+    #[test]
+    fn right_click_job_row_without_tail_action_omits_tail_log() {
+        let mut app = app_with_jobs(false);
+        app.state.jobs.groups[0].rows[0].actions = vec!["cancel".to_string()];
+        let layout = app.state.sidebar_layout();
+        let row_hit = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id != hit.group_id)
+            .expect("job row")
+            .clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row_hit.rect.x,
+            row_hit.rect.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("context menu open");
+        assert_eq!(menu.items(), &["Cancel job", "Copy job ID"]);
+    }
+
+    #[test]
+    fn right_click_job_group_header_does_not_open_a_context_menu() {
+        let mut app = app_with_jobs(false);
+        let layout = app.state.sidebar_layout();
+        let group_header = layout
+            .jobs_rows
+            .iter()
+            .find(|hit| hit.row_id == hit.group_id)
+            .expect("group header row")
+            .clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            group_header.rect.x,
+            group_header.rect.y,
+        ));
+
+        assert!(app.state.context_menu.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn wheel_over_jobs_rect_scrolls_jobs() {
+        let mut app = app_with_scrollable_jobs();
+        let jobs = app.state.sidebar_layout().jobs;
+        assert!(crate::ui::should_show_scrollbar(
+            crate::ui::jobs_list_scroll_metrics(&app.state, jobs)
+        ));
+        assert_eq!(app.state.jobs.scroll, 0);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, jobs.x, jobs.y + 1));
+        assert_eq!(app.state.jobs.scroll, 1);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, jobs.x, jobs.y + 1));
+        assert_eq!(app.state.jobs.scroll, 0);
+    }
+
+    #[test]
+    fn dragging_the_jobs_scrollbar_thumb_scrolls_the_body() {
+        let mut app = app_with_scrollable_jobs();
+        let track = app
+            .state
+            .sidebar_layout()
+            .jobs_scrollbar
+            .expect("jobs scrollbar visible");
+
+        // `jobs.scroll` starts at 0, so the thumb sits at the top of the track.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(crate::app::state::DragTarget::JobsScrollbar { .. })
+        ));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y + track.height - 1,
+        ));
+
+        assert!(
+            app.state.jobs.scroll > 0,
+            "dragging the thumb toward the bottom of the track should scroll the body down"
+        );
     }
 }

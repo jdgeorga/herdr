@@ -71,6 +71,7 @@ mod integration;
 mod ipc;
 mod kitty_graphics;
 mod layout;
+mod list_section;
 mod logging;
 mod metadata_tokens;
 mod noninteractive_process;

@@ -440,6 +440,99 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
     );
 }
 
+pub(crate) fn list_action_confirm_popup_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 64, 8)
+}
+
+pub(crate) fn list_action_confirm_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "confirm",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+/// Jobs sidebar action confirmation (design doc: "Actions"), mirroring
+/// `render_remove_worktree_overlay`: the frozen `prompt` is the whole
+/// message (e.g. "Cancel job 55241874 (ued)?"), since it's already a
+/// fully-resolved sentence -- there's no separate path/detail line to show.
+pub(super) fn render_list_action_confirm_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(confirm) = app.list_action_confirm.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let Some(popup) = list_action_confirm_popup_rect(area) else {
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, app.palette.accent, app.palette.panel_bg)
+    else {
+        return;
+    };
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas::<3>(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" {}", confirm.prompt),
+            Style::default()
+                .fg(app.palette.text)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        rows[0],
+    );
+
+    if confirm.in_progress {
+        frame.render_widget(
+            Paragraph::new(" running…").style(Style::default().fg(app.palette.overlay0)),
+            rows[1],
+        );
+    } else if let Some(error) = &confirm.error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
+            rows[1],
+        );
+    }
+
+    let (confirm_rect, cancel_rect) = list_action_confirm_button_rects(inner);
+    render_action_button(
+        frame,
+        confirm_rect,
+        Some("↵"),
+        "confirm",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     let Some(open) = app.worktree_open.as_ref() else {
         return;
@@ -798,6 +891,7 @@ mod tests {
 
     use super::{
         confirm_close_overlay_text, render_new_linked_worktree_overlay, render_rename_overlay,
+        render_list_action_confirm_overlay,
     };
 
     #[test]
@@ -956,6 +1050,79 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("fatal: a branch named 'foo' already exists"));
+    }
+
+    #[test]
+    fn list_action_confirm_overlay_renders_the_frozen_prompt() {
+        let mut app = AppState::test_new();
+        app.list_action_confirm = Some(crate::app::state::ListActionConfirmState {
+            action_id: "cancel".into(),
+            label: "Cancel job".into(),
+            argv: vec!["scancel".into(), "--".into(), "55241874".into()],
+            cwd: None,
+            prompt: "Cancel job 55241874 (ued)?".into(),
+            generation: 1,
+            in_progress: false,
+            error: None,
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_list_action_confirm_overlay(&app, frame, Rect::new(0, 0, 100, 30)))
+            .expect("list action confirm overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Cancel job 55241874 (ued)?"));
+        assert!(rendered.contains("confirm"));
+        assert!(rendered.contains("cancel"));
+    }
+
+    #[test]
+    fn list_action_confirm_overlay_shows_the_error_when_not_in_progress() {
+        let mut app = AppState::test_new();
+        app.list_action_confirm = Some(crate::app::state::ListActionConfirmState {
+            action_id: "cancel".into(),
+            label: "Cancel job".into(),
+            argv: vec!["scancel".into(), "--".into(), "55241874".into()],
+            cwd: None,
+            prompt: "Cancel job 55241874 (ued)?".into(),
+            generation: 1,
+            in_progress: false,
+            error: Some("permission denied".into()),
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_list_action_confirm_overlay(&app, frame, Rect::new(0, 0, 100, 30)))
+            .expect("list action confirm overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("permission denied"));
+    }
+
+    #[test]
+    fn list_action_confirm_hit_test_geometry_matches_modal_size() {
+        let area = Rect::new(0, 0, 100, 30);
+        let popup = super::list_action_confirm_popup_rect(area).unwrap();
+        let inner = Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, popup.height - 2);
+        let (confirm, cancel) = super::list_action_confirm_button_rects(inner);
+
+        assert_eq!(confirm.y, inner.y + inner.height - 1);
+        assert_eq!(cancel.y, inner.y + inner.height - 1);
     }
 
     #[test]

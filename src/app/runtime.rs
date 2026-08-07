@@ -311,6 +311,10 @@ impl App {
             self.state.toast = None;
             changed = true;
         }
+        // Design doc: "Notifications" -- refills the toast slot from the
+        // queued Jobs provider notifications as it frees, independent of
+        // whatever else freed it above.
+        changed |= self.drain_list_notify_queue();
 
         if self
             .state
@@ -362,6 +366,7 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
+        self.start_list_poll_if_due(now);
 
         if self
             .next_auto_update_check
@@ -619,6 +624,12 @@ impl App {
             self.copy_feedback_deadline,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
+                .flatten(),
+            // Gated on the same flag as git refresh: headless polling is
+            // gated on an attached app client, exactly as headless git
+            // refresh is (design doc: "Polling").
+            include_git_refresh
+                .then(|| self.list_poll_deadline())
                 .flatten(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
