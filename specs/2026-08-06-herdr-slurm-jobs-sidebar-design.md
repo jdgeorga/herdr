@@ -364,11 +364,26 @@ list renderer in new files where possible to reduce conflict area.
 update check, and the stock binary should be preserved as `herdr-stock` first —
 it is the only fallback if a rebase breaks mid-week.
 
-**Toolchain.** No rustc/cargo on this machine. `module load rust/stable` is
-rustup-based and already pinned at 1.96.1, matching `rust-toolchain.toml`, but
-its `RUSTUP_HOME` is read-only and errors on use. Redirect `RUSTUP_HOME`,
-`CARGO_HOME`, and `CARGO_TARGET_DIR` to pscratch; `$HOME` is at 73% of a 40 GiB
-quota and must not hold build artifacts.
+**Toolchain.** Two prerequisites, both resolved; see `build-env.sh` at the repo
+root, which every build must source.
+
+1. No rustc/cargo on this machine. `module load rust/stable` is rustup-based and
+   resolves to 1.96.1, matching `rust-toolchain.toml`, but the module's own
+   `RUSTUP_HOME` points at read-only shared software and errors on use.
+   Redirect `RUSTUP_HOME`, `CARGO_HOME`, and `CARGO_TARGET_DIR` to pscratch.
+   `$HOME` is at 73% of a 40 GiB quota and must not hold build artifacts.
+2. **`build.rs` requires zig.** herdr vendors libghostty-vt and `build.rs:63-80`
+   shells out to `zig build -Demit-lib-vt`, panicking with a bare `NotFound` if
+   zig is absent. `vendor/libghostty-vt/build.zig.zon` declares
+   `minimum_zig_version = "0.15.2"`. There is no NERSC zig module. Installed
+   0.15.2 from the official tarball to `$PSCRATCH/tools/zig-0.15.2` and exported
+   `ZIG` plus `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` (which otherwise
+   default under `$HOME`). Pinned to 0.15.2 rather than 0.16/0.17 because zig
+   breaks builds across minor versions.
+
+`build.rs` also honours `LIBGHOSTTY_VT_ZIG_SYSTEM_DIR` for a prebuilt
+libghostty-vt, which would avoid zig entirely — not pursued, since a pinned zig
+tarball is simpler than sourcing a matching prebuilt library.
 
 **System notifications do not work here.** Herdr's system toast path shells out
 to `notify-send` gated on `$DISPLAY`/`$WAYLAND_DISPLAY`, a silent no-op on an
