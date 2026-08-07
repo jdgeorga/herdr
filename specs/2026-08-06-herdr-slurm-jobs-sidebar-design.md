@@ -49,6 +49,13 @@ Owns everything SLURM-specific: the squeue invocation and its field layout, the
 10-minute linger buffer for finished jobs, the sacct exit-code lookup, history
 mode, and the decision of when to emit a notification.
 
+Interpreter: bare `python3` on NERSC login nodes is **3.6.15**. The provider is
+invoked as `/usr/bin/python3.11` explicitly. Do not rely on `python3` resolving
+to anything modern, and do not assume the interpreter is the same one used by
+other tooling on the node. Alternatively the script may be written 3.6-clean —
+no f-string `=`, no dataclasses, no walrus — but pinning 3.11 is preferred since
+the path is stable and the provider is ours.
+
 The split matters because every part the user will keep adjusting — grouping,
 linger duration, which fields show, what counts as a failure — lives in the
 script. Adjusting the display costs a 10-second poll, not a rebuild of 266
@@ -127,7 +134,7 @@ placement = "bottom"          # "top" | "bottom"
 collapsed = true              # initial state; runtime changes persist
 refresh_seconds = 10
 max_visible_rows = 12
-command = ["python3", "~/.config/herdr/scripts/herdr-jobs.py", "--mode", "{mode}"]
+command = ["/usr/bin/python3.11", "~/.config/herdr/scripts/herdr-jobs.py", "--mode", "{mode}"]
 modes = ["live", "history"]   # first is default; header toggle cycles
 timeout_seconds = 5
 
