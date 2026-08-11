@@ -810,6 +810,63 @@
           "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim } style tables. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
         },
         {
+          "key": "ui.sidebar.list.enabled",
+          "type": "boolean",
+          "default": "true",
+          "description": "Show the polled Jobs list section in the sidebar."
+        },
+        {
+          "key": "ui.sidebar.list.placement",
+          "type": "enum",
+          "default": "\"bottom\"",
+          "description": "Place the Jobs list at the bottom of the sidebar.",
+          "values": [
+            "bottom"
+          ]
+        },
+        {
+          "key": "ui.sidebar.list.collapsed",
+          "type": "boolean",
+          "default": "true",
+          "description": "Start the Jobs list section collapsed."
+        },
+        {
+          "key": "ui.sidebar.list.refresh_seconds",
+          "type": "integer",
+          "default": "10",
+          "description": "Seconds between Jobs provider polls."
+        },
+        {
+          "key": "ui.sidebar.list.timeout_seconds",
+          "type": "integer",
+          "default": "5",
+          "description": "Seconds before a Jobs provider poll is cancelled. Must be less than refresh_seconds."
+        },
+        {
+          "key": "ui.sidebar.list.max_visible_rows",
+          "type": "integer",
+          "default": "12",
+          "description": "Maximum Jobs body rows shown before the section scrolls."
+        },
+        {
+          "key": "ui.sidebar.list.command",
+          "type": "array of strings",
+          "default": "[\"/usr/bin/python3.11\", \"-I\", \"-S\", \"~/.config/herdr/scripts/herdr-jobs.py\", \"--mode\", \"{mode}\"]",
+          "description": "Provider command argv. Herdr substitutes {mode} in arguments but requires the executable itself to be literal."
+        },
+        {
+          "key": "ui.sidebar.list.modes",
+          "type": "array of strings",
+          "default": "[\"live\", \"history\"]",
+          "description": "Modes offered by the Jobs header toggle and passed to the provider command."
+        },
+        {
+          "key": "ui.sidebar.list.styles",
+          "type": "table of colors",
+          "default": "built-in job-state colors",
+          "description": "Map provider style tokens such as ok, fail, warn, muted, and normal to sidebar colors."
+        },
+        {
           "key": "ui.accent",
           "type": "color",
           "default": "\"cyan\"",
