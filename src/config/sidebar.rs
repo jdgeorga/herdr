@@ -725,11 +725,7 @@ impl Default for ListSectionConfig {
                 ListActionConfig {
                     id: "cancel".to_string(),
                     label: "Cancel job".to_string(),
-                    command: vec![
-                        "scancel".to_string(),
-                        "--".to_string(),
-                        "{id}".to_string(),
-                    ],
+                    command: vec!["scancel".to_string(), "--".to_string(), "{id}".to_string()],
                     confirm: Some("Cancel job {id} ({cell0})?".to_string()),
                     target: ActionTarget::Background,
                     cwd: None,

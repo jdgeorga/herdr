@@ -28,9 +28,9 @@ pub use self::{
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
-        ActionTarget, AgentSidebarToken, AgentsSidebarConfig, ColumnAlign, ColumnSpec,
-        ColumnWidth, ListActionConfig, ListSectionConfig, SidebarConfig,
-        SidebarTokenStyle, SpaceSidebarToken, SpacesSidebarConfig,
+        ActionTarget, AgentSidebarToken, AgentsSidebarConfig, ColumnAlign, ColumnSpec, ColumnWidth,
+        ListActionConfig, ListSectionConfig, SidebarConfig, SidebarTokenStyle, SpaceSidebarToken,
+        SpacesSidebarConfig,
     },
     sound::SoundConfig,
     tab_bar::TabBarRightEntryConfig,

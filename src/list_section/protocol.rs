@@ -319,11 +319,7 @@ pub fn parse_provider_payload(
                 continue;
             }
 
-            let cells = row
-                .cells
-                .iter()
-                .map(sanitize_provider_string)
-                .collect();
+            let cells = row.cells.iter().map(sanitize_provider_string).collect();
 
             let style = match row.style.map(|raw| sanitize_provider_string(&raw)) {
                 None => RowStyle::default(),
@@ -356,11 +352,7 @@ pub fn parse_provider_payload(
                 })
                 .collect();
 
-            let actions = row
-                .actions
-                .iter()
-                .map(sanitize_provider_string)
-                .collect();
+            let actions = row.actions.iter().map(sanitize_provider_string).collect();
 
             rows.push(ParsedRow {
                 id: row_id,
@@ -603,7 +595,10 @@ const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 200;
 /// Sanitizes and truncates `err`'s `Display` output for inclusion in a
 /// diagnostic. See [`MAX_DIAGNOSTIC_DETAIL_BYTES`].
 fn bounded_diagnostic_detail(err: &impl std::fmt::Display) -> String {
-    truncate_at_char_boundary(&sanitize_provider_string(err.to_string()), MAX_DIAGNOSTIC_DETAIL_BYTES)
+    truncate_at_char_boundary(
+        &sanitize_provider_string(err.to_string()),
+        MAX_DIAGNOSTIC_DETAIL_BYTES,
+    )
 }
 
 /// Truncates `s` to at most `max_bytes` bytes, backing off to the nearest
@@ -927,7 +922,7 @@ mod tests {
     #[test]
     fn sanitize_bounds_pathological_combining_mark_runs() {
         let base = 'e';
-        let combining: String = std::iter::repeat('\u{0301}').take(500).collect();
+        let combining = "\u{0301}".repeat(500);
         let input = format!("{base}{combining}");
         let out = sanitize_provider_string(&input);
         // The base character plus at most the cap's worth of combining
@@ -938,7 +933,7 @@ mod tests {
 
     #[test]
     fn sanitize_combining_run_resets_per_base_character() {
-        let combining: String = std::iter::repeat('\u{0301}').take(20).collect();
+        let combining = "\u{0301}".repeat(20);
         let input = format!("a{combining}b{combining}");
         let out = sanitize_provider_string(&input);
         let a_run = out.chars().take_while(|&c| c != 'b').count();
@@ -1006,8 +1001,7 @@ mod tests {
 
     #[test]
     fn valid_empty_payload_is_distinct_from_failure() {
-        let parsed =
-            parse(r#"{"version":1,"groups":[],"notify":[]}"#).expect("valid");
+        let parsed = parse(r#"{"version":1,"groups":[],"notify":[]}"#).expect("valid");
         assert!(parsed.groups.is_empty());
         assert!(parsed.notify.is_empty());
         assert!(parsed.diagnostics.is_empty());
@@ -1017,8 +1011,7 @@ mod tests {
 
     #[test]
     fn unknown_top_level_fields_are_ignored() {
-        let parsed =
-            parse(r#"{"version":1,"totally_unknown":{"x":1}}"#).expect("valid");
+        let parsed = parse(r#"{"version":1,"totally_unknown":{"x":1}}"#).expect("valid");
         assert!(parsed.diagnostics.is_empty());
     }
 
@@ -1364,7 +1357,9 @@ mod tests {
 
     fn string_payload(len: usize) -> String {
         let value = "a".repeat(len);
-        format!(r#"{{"version":1,"groups":[{{"id":"g","rows":[{{"id":"1","cells":["{value}"]}}]}}]}}"#)
+        format!(
+            r#"{{"version":1,"groups":[{{"id":"g","rows":[{{"id":"1","cells":["{value}"]}}]}}]}}"#
+        )
     }
 
     #[test]

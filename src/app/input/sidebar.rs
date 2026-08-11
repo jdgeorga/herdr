@@ -173,9 +173,13 @@ impl AppState {
 
     pub(super) fn scroll_jobs(&mut self, delta: i16) {
         let layout = self.sidebar_layout();
-        let max_scroll = crate::ui::jobs_list_scroll_metrics(self, layout.jobs).max_offset_from_bottom;
+        let max_scroll =
+            crate::ui::jobs_list_scroll_metrics(self, layout.jobs).max_offset_from_bottom;
         if delta.is_negative() {
-            self.jobs.scroll = self.jobs.scroll.saturating_sub(delta.unsigned_abs() as usize);
+            self.jobs.scroll = self
+                .jobs
+                .scroll
+                .saturating_sub(delta.unsigned_abs() as usize);
         } else {
             self.jobs.scroll = self
                 .jobs
