@@ -97,7 +97,7 @@ if [[ $dry_run -eq 1 ]]; then
   exit 0
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ $do_rebase -eq 1 && -n "$(git status --porcelain)" ]]; then
   die "working tree is dirty; commit or stash before rebasing"
 fi
 
