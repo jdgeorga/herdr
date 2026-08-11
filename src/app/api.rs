@@ -168,7 +168,7 @@ impl App {
 
         if let AppEvent::ListSectionPolled { identity, outcome } = ev {
             self.handle_list_section_polled(identity, outcome);
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::ListActionFinished {
@@ -178,7 +178,7 @@ impl App {
         } = ev
         {
             self.handle_list_action_finished(generation, label, result);
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::PluginCommandFinished {
