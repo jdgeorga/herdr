@@ -203,7 +203,7 @@ impl App {
         self.last_list_poll = now;
         let event_tx = self.event_tx.clone();
         let child_slot = self.list_poll_child.clone();
-        let event_identity = identity.clone();
+        let event_identity = identity;
         std::thread::spawn(move || {
             let outcome =
                 catch_worker_panic(|| run_list_poll(&argv, timeout, &child_slot, &known_styles));
@@ -307,7 +307,10 @@ fn list_poll_interval(config: &crate::config::ListSectionConfig) -> Duration {
     Duration::from_secs(config.refresh_seconds.max(1))
 }
 
-fn jobs_groups_contain_row(groups: &[crate::list_section::protocol::ParsedGroup], row_id: &str) -> bool {
+fn jobs_groups_contain_row(
+    groups: &[crate::list_section::protocol::ParsedGroup],
+    row_id: &str,
+) -> bool {
     groups
         .iter()
         .any(|group| group.rows.iter().any(|row| row.id == row_id))
@@ -387,9 +390,7 @@ fn run_list_poll(
             // let this child escape shutdown's reach.
             kill_process_group(pid);
             let _ = child.wait();
-            return ListPollOutcome::Failed(
-                "list section poll cancelled by shutdown".to_string(),
-            );
+            return ListPollOutcome::Failed("list section poll cancelled by shutdown".to_string());
         }
     };
 
@@ -485,18 +486,14 @@ fn run_list_poll(
         return ListPollOutcome::Failed(format!("exited with {status}"));
     }
     if stdout_truncated {
-        return ListPollOutcome::Failed(format!(
-            "stdout exceeded the {MAX_STREAM_BYTES} byte cap"
-        ));
+        return ListPollOutcome::Failed(format!("stdout exceeded the {MAX_STREAM_BYTES} byte cap"));
     }
     if stderr_truncated {
         // Design doc finding: "Valid stdout plus >256 KiB stderr and exit 0
         // is ACCEPTED instead of marked stale" -- a provider that floods
         // stderr is misbehaving even if stdout happens to parse, and that
         // should surface as staleness, not be silently accepted.
-        return ListPollOutcome::Failed(format!(
-            "stderr exceeded the {MAX_STREAM_BYTES} byte cap"
-        ));
+        return ListPollOutcome::Failed(format!("stderr exceeded the {MAX_STREAM_BYTES} byte cap"));
     }
 
     let stdout_text = String::from_utf8_lossy(&stdout_bytes);
@@ -542,9 +539,9 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> std::io::Result<(Vec<u8>, 
 fn describe_parse_failure(err: &ParseFailure) -> String {
     match err {
         ParseFailure::Malformed(message) => format!("malformed provider output: {message}"),
-        ParseFailure::VersionMismatch { expected, found } => format!(
-            "provider protocol version mismatch: expected {expected}, found {found:?}"
-        ),
+        ParseFailure::VersionMismatch { expected, found } => {
+            format!("provider protocol version mismatch: expected {expected}, found {found:?}")
+        }
         ParseFailure::Oversized(message) => format!("provider output oversized: {message}"),
     }
 }
@@ -625,7 +622,9 @@ mod tests {
         let mut app = test_app(&crate::config::Config::default());
         let now = Instant::now();
         app.mark_list_poll_due(now);
-        assert!(app.list_poll_deadline().is_some_and(|deadline| deadline <= now));
+        assert!(app
+            .list_poll_deadline()
+            .is_some_and(|deadline| deadline <= now));
     }
 
     #[test]
@@ -741,7 +740,10 @@ mod tests {
         }];
         app.state.jobs.is_stale = true;
 
-        app.apply_list_poll_outcome(ListPollOutcome::Success(ParsedPayload::default()), Instant::now());
+        app.apply_list_poll_outcome(
+            ListPollOutcome::Success(ParsedPayload::default()),
+            Instant::now(),
+        );
 
         assert!(app.state.jobs.groups.is_empty());
         assert!(!app.state.jobs.is_stale);
@@ -763,7 +765,10 @@ mod tests {
 
         assert_eq!(app.state.jobs.groups.len(), 1);
         assert!(app.state.jobs.is_stale);
-        assert_eq!(app.state.jobs.last_error.as_deref(), Some("timed out after 5s"));
+        assert_eq!(
+            app.state.jobs.last_error.as_deref(),
+            Some("timed out after 5s")
+        );
     }
 
     #[test]
@@ -772,7 +777,10 @@ mod tests {
         app.state.jobs.is_stale = true;
         app.state.jobs.last_error = Some("boom".to_string());
 
-        app.apply_list_poll_outcome(ListPollOutcome::Success(ParsedPayload::default()), Instant::now());
+        app.apply_list_poll_outcome(
+            ListPollOutcome::Success(ParsedPayload::default()),
+            Instant::now(),
+        );
 
         assert!(!app.state.jobs.is_stale);
         assert_eq!(app.state.jobs.last_error, None);
@@ -815,7 +823,10 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(app.state.jobs.selected_row_id.as_deref(), Some("still-here"));
+        assert_eq!(
+            app.state.jobs.selected_row_id.as_deref(),
+            Some("still-here")
+        );
     }
 
     // -- last_success_label ---------------------------------------------------
@@ -966,7 +977,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_list_poll_fails_on_non_zero_exit() {
-        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "exit 7".to_string()];
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 7".to_string(),
+        ];
         let outcome = run_list_poll(&argv, Duration::from_secs(5), &empty_child_slot(), &[]);
         assert!(matches!(outcome, ListPollOutcome::Failed(_)));
     }
@@ -1016,18 +1031,10 @@ mod tests {
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            format!(
-                "sleep 30 & echo $! > {} ; wait",
-                pid_file.display()
-            ),
+            format!("sleep 30 & echo $! > {} ; wait", pid_file.display()),
         ];
 
-        let outcome = run_list_poll(
-            &argv,
-            Duration::from_millis(200),
-            &empty_child_slot(),
-            &[],
-        );
+        let outcome = run_list_poll(&argv, Duration::from_millis(200), &empty_child_slot(), &[]);
         assert!(matches!(outcome, ListPollOutcome::Failed(ref msg) if msg.contains("timed out")));
 
         // The grandchild `sleep 30`'s pid was written before the timeout;

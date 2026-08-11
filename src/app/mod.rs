@@ -16,10 +16,10 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
-pub(crate) mod pane_graphics;
 mod list_actions;
 mod list_notify;
 mod list_refresh;
+pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
 mod runtime_mutations;
@@ -63,8 +63,8 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
-pub use state::{AppState, Mode, ToastKind, ViewState};
 pub(crate) use list_refresh::{ListPollIdentity, ListPollOutcome};
+pub use state::{AppState, Mode, ToastKind, ViewState};
 
 pub(crate) fn load_plugin_manifest(
     path: &str,
@@ -850,7 +850,9 @@ impl App {
             list_poll_in_flight: false,
             list_poll_due_after_in_flight: false,
             list_poll_generation: 0,
-            list_poll_child: Arc::new(Mutex::new(crate::app::list_refresh::ListPollShared::default())),
+            list_poll_child: Arc::new(Mutex::new(
+                crate::app::list_refresh::ListPollShared::default(),
+            )),
             next_list_action_generation: 1,
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
@@ -962,8 +964,7 @@ impl App {
         if let Some(collapsed) = snapshot.jobs_collapsed {
             app.state.jobs.collapsed = collapsed;
         }
-        app.state.jobs.mode =
-            resolve_persisted_jobs_mode(config, snapshot.jobs_mode.clone());
+        app.state.jobs.mode = resolve_persisted_jobs_mode(config, snapshot.jobs_mode.clone());
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {

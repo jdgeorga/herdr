@@ -890,8 +890,8 @@ mod tests {
     };
 
     use super::{
-        confirm_close_overlay_text, render_new_linked_worktree_overlay, render_rename_overlay,
-        render_list_action_confirm_overlay,
+        confirm_close_overlay_text, render_list_action_confirm_overlay,
+        render_new_linked_worktree_overlay, render_rename_overlay,
     };
 
     #[test]

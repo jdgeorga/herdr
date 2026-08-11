@@ -24,7 +24,9 @@ use crate::app::state::{ListActionConfirmState, ToastKind, ToastNotification};
 use crate::config::{ActionTarget, ListActionConfig};
 use crate::events::AppEvent;
 use crate::list_section::protocol::{ParsedGroup, ParsedRow};
-use crate::list_section::substitute::{resolve_argv, validate_path, validate_token, RowContext, SubstError};
+use crate::list_section::substitute::{
+    resolve_argv, validate_path, validate_token, RowContext, SubstError,
+};
 
 impl App {
     /// Resolves and either confirms or runs a Jobs sidebar action, chosen off
@@ -248,7 +250,12 @@ impl App {
     /// `target = "overlay"` (design doc: "Tail-log uses
     /// `spawn_overlay_argv_command`... the caller must integrate the
     /// returned `NewPane` as the scrollback caller does").
-    fn launch_overlay_list_action(&mut self, label: String, argv: Vec<String>, cwd: Option<PathBuf>) {
+    fn launch_overlay_list_action(
+        &mut self,
+        label: String,
+        argv: Vec<String>,
+        cwd: Option<PathBuf>,
+    ) {
         match self.spawn_overlay_argv_command(&argv, cwd, Vec::new(), Vec::new()) {
             Ok((_, new_pane)) => {
                 let terminal_id = new_pane.terminal.id.clone();

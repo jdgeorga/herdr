@@ -268,12 +268,7 @@ mod tests {
             &["ued", "4N", "1:23:45"],
             &[("log", "/pscratch/sd/j/jdgeorga/ued/slurm-55241874.out")],
         );
-        let argv = resolve_argv(
-            &tpl(&["tail", "-f", "--", "{log}"]),
-            &r,
-            "live",
-        )
-        .unwrap();
+        let argv = resolve_argv(&tpl(&["tail", "-f", "--", "{log}"]), &r, "live").unwrap();
         assert_eq!(
             argv,
             vec![
@@ -392,10 +387,7 @@ mod tests {
         // if one exists.
         let r = row("1", &[], &[("foo{bar", "sneaky")]);
         let err = resolve_argv(&tpl(&["echo", "{foo{bar}"]), &r, "live").unwrap_err();
-        assert_eq!(
-            err,
-            SubstError::InvalidTokenName("foo{".to_string())
-        );
+        assert_eq!(err, SubstError::InvalidTokenName("foo{".to_string()));
     }
 
     #[test]
@@ -452,7 +444,10 @@ mod tests {
     fn job_id_regex_accepts_plain_array_and_heterogeneous_ids() {
         let re = Regex::new(JOB_ID_PATTERN).unwrap();
         for good in ["55241874", "123_4", "123+1"] {
-            assert!(validate_token(good, &re).is_ok(), "expected {good:?} to be valid");
+            assert!(
+                validate_token(good, &re).is_ok(),
+                "expected {good:?} to be valid"
+            );
         }
     }
 

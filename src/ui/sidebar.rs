@@ -316,8 +316,9 @@ pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], i
 }
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let ws_area = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
-        .spaces;
+    let ws_area =
+        compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
+            .spaces;
     let body = workspace_list_body_rect(ws_area, false);
     if body.height == 0 {
         return requested;
@@ -670,8 +671,9 @@ pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
 ) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
-    let ws_area = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
-        .spaces;
+    let ws_area =
+        compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(app))
+            .spaces;
     compute_workspace_list_areas_for_spaces(app, ws_area)
 }
 
@@ -861,7 +863,9 @@ fn jobs_has_content(state: &JobsSectionState) -> bool {
 /// computation ([`jobs_content_layout`]) and rendering ([`render_jobs_section`])
 /// so they cannot disagree about what's on screen.
 enum JobsPlanRow<'a> {
-    GroupHeader { group: &'a ParsedGroup },
+    GroupHeader {
+        group: &'a ParsedGroup,
+    },
     Row {
         group_id: &'a str,
         row: &'a ParsedRow,
@@ -1278,7 +1282,11 @@ fn jobs_stale_label(state: &JobsSectionState) -> Option<String> {
 /// the mode toggle (only the mode toggle gets a mouse hit target -- the stale
 /// label is informational). Staleness takes priority: there's no room to show
 /// both, and a stale result is the more actionable state to surface.
-fn jobs_header_right_text(state: &JobsSectionState, config: &ListSectionConfig, collapsed_style: bool) -> Option<(String, bool)> {
+fn jobs_header_right_text(
+    state: &JobsSectionState,
+    config: &ListSectionConfig,
+    collapsed_style: bool,
+) -> Option<(String, bool)> {
     if let Some(stale) = jobs_stale_label(state) {
         return Some((stale, false));
     }
@@ -1334,14 +1342,24 @@ fn jobs_content_layout(
         return (Vec::new(), None, header_hits, no_scroll);
     }
 
-    let body_rect = Rect::new(jobs_rect.x, jobs_rect.y + 1, jobs_rect.width, jobs_rect.height - 1);
+    let body_rect = Rect::new(
+        jobs_rect.x,
+        jobs_rect.y + 1,
+        jobs_rect.width,
+        jobs_rect.height - 1,
+    );
     let plan = jobs_body_plan(state);
     let (scroll, metrics) = jobs_scroll_metrics(plan.len(), body_rect.height, state.scroll);
     let has_scrollbar = should_show_scrollbar(metrics);
     let content_width = body_rect.width.saturating_sub(u16::from(has_scrollbar));
 
     let mut rows = Vec::new();
-    for (offset, plan_row) in plan.iter().skip(scroll).take(metrics.viewport_rows).enumerate() {
+    for (offset, plan_row) in plan
+        .iter()
+        .skip(scroll)
+        .take(metrics.viewport_rows)
+        .enumerate()
+    {
         let rect = Rect::new(body_rect.x, body_rect.y + offset as u16, content_width, 1);
         // Group headers use their own id as both `row_id` and `group_id`,
         // but `kind` -- not that id equality -- is what tells a group header
@@ -1452,7 +1470,11 @@ fn jobs_column_rects(row_rect: Rect, columns: &[ColumnSpec]) -> Vec<Rect> {
     rects
 }
 
-fn jobs_mode_toggle_spans(config: &ListSectionConfig, current_mode: &str, p: &Palette) -> Vec<Span<'static>> {
+fn jobs_mode_toggle_spans(
+    config: &ListSectionConfig,
+    current_mode: &str,
+    p: &Palette,
+) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled("[", Style::default().fg(p.overlay0))];
     for (index, mode) in config.modes.iter().enumerate() {
         if index > 0 {
@@ -1536,7 +1558,13 @@ fn render_jobs_header(
     }
 }
 
-fn render_jobs_group_header(frame: &mut Frame, rect: Rect, group: &ParsedGroup, collapsed: bool, p: &Palette) {
+fn render_jobs_group_header(
+    frame: &mut Frame,
+    rect: Rect,
+    group: &ParsedGroup,
+    collapsed: bool,
+    p: &Palette,
+) {
     if rect.width == 0 {
         return;
     }
@@ -1636,7 +1664,11 @@ fn render_jobs_section(app: &AppState, frame: &mut Frame, layout: &SidebarLayout
     );
 
     for row_hit in &layout.jobs_rows {
-        let Some(group) = state.groups.iter().find(|group| group.id == row_hit.group_id) else {
+        let Some(group) = state
+            .groups
+            .iter()
+            .find(|group| group.id == row_hit.group_id)
+        else {
             continue;
         };
         if row_hit.kind == JobRowHitKind::Group {
@@ -1689,7 +1721,8 @@ pub(super) fn render_sidebar_collapsed(
     // `app.view.sidebar_layout`) or a test (passing a synthetic layout built
     // with `compute_sidebar_layout`/`compute_collapsed_sidebar_layout`
     // directly against the same `area`).
-    let (ws_area, divider_y, detail_area) = (layout.spaces, layout.section_divider_y, layout.agents);
+    let (ws_area, divider_y, detail_area) =
+        (layout.spaces, layout.section_divider_y, layout.agents);
     render_jobs_section(app, frame, layout);
     if ws_area == Rect::default() {
         render_sidebar_toggle(app, frame, layout.toggle, true, p);
@@ -2553,7 +2586,9 @@ mod tests {
         let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         expanded
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         assert!(expanded
             .backend()
@@ -2594,7 +2629,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -2647,7 +2684,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -2674,7 +2713,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -2718,7 +2759,9 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let h = buffer[(find_symbol_x(buffer, row, 25, "H"), row)].style();
@@ -2821,7 +2864,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(18, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
@@ -2853,7 +2898,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut renderer = Terminal::new(TestBackend::new(10, 12)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         renderer
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
         let body = agent_panel_body_rect(agent_area, false);
@@ -3148,7 +3195,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     ) -> Vec<Vec<ratatui::style::Style>> {
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
-        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
+        let layout = compute_collapsed_sidebar_layout_for_test(app, area);
         terminal
             .draw(|frame| render_sidebar_collapsed(app, frame, area, &layout))
             .expect("collapsed sidebar should render");
@@ -3681,7 +3728,11 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     fn expanded_layout_toggle_row_always_survives_regardless_of_jobs() {
         for height in 0u16..=30 {
             let area = Rect::new(0, 0, 26, height);
-            for jobs in [JobsSectionWant::hidden(), jobs_want(4, 12), jobs_want(20, 20)] {
+            for jobs in [
+                JobsSectionWant::hidden(),
+                jobs_want(4, 12),
+                jobs_want(20, 20),
+            ] {
                 let layout = compute_expanded_sidebar_layout(area, 0.5, jobs);
                 assert_eq!(
                     layout.toggle,
@@ -3714,7 +3765,11 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     fn collapsed_layout_toggle_row_always_survives_regardless_of_jobs() {
         for height in 0u16..=30 {
             let area = Rect::new(0, 0, 26, height);
-            for jobs in [JobsSectionWant::hidden(), jobs_want(4, 12), jobs_want(20, 20)] {
+            for jobs in [
+                JobsSectionWant::hidden(),
+                jobs_want(4, 12),
+                jobs_want(20, 20),
+            ] {
                 let layout = compute_collapsed_sidebar_layout(area, jobs);
                 assert_eq!(
                     layout.toggle,
@@ -3829,10 +3884,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     jobs_want(40, 12),
                 ] {
                     for (layout, label) in [
-                        (
-                            compute_expanded_sidebar_layout(area, 0.5, jobs),
-                            "expanded",
-                        ),
+                        (compute_expanded_sidebar_layout(area, 0.5, jobs), "expanded"),
                         (compute_collapsed_sidebar_layout(area, jobs), "collapsed"),
                     ] {
                         assert!(
@@ -4016,7 +4068,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         for width in 0u16..=30 {
             for height in 0u16..=30 {
                 let area = Rect::new(0, 0, width, height);
-                let expanded = compute_expanded_sidebar_layout(area, 0.5, JobsSectionWant::hidden());
+                let expanded =
+                    compute_expanded_sidebar_layout(area, 0.5, JobsSectionWant::hidden());
                 let (spaces, agents) = expanded_sidebar_sections(area, 0.5);
                 assert_eq!(expanded.spaces, spaces);
                 assert_eq!(expanded.agents, agents);
@@ -4629,7 +4682,10 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.jobs.last_error = Some("failed to spawn: No such file or directory".to_string());
 
         let want = jobs_section_want(&app);
-        assert!(want.enabled, "a first-poll failure must not hide the section");
+        assert!(
+            want.enabled,
+            "a first-poll failure must not hide the section"
+        );
 
         let area = Rect::new(0, 0, 26, 20);
         let layout = compute_sidebar_layout(&app, area);
@@ -4637,7 +4693,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
@@ -4742,10 +4800,16 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
+        let layout = compute_expanded_sidebar_layout(
+            area,
+            app.sidebar_section_split,
+            jobs_section_want(&app),
+        );
         assert_eq!(layout.jobs.height, 1);
         let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
         assert!(text.contains("JOBS"), "header text was {text:?}");
@@ -4765,11 +4829,20 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
-        assert!(layout.jobs.height > 1, "expected room for a body below the header");
+        let layout = compute_expanded_sidebar_layout(
+            area,
+            app.sidebar_section_split,
+            jobs_section_want(&app),
+        );
+        assert!(
+            layout.jobs.height > 1,
+            "expected room for a body below the header"
+        );
         let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
         assert!(text.contains("[live|history]"), "header text was {text:?}");
         assert_eq!(buffer[(layout.jobs.x, layout.jobs.y)].symbol(), "▾");
@@ -4788,10 +4861,16 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let layout = compute_expanded_sidebar_layout(area, app.sidebar_section_split, jobs_section_want(&app));
+        let layout = compute_expanded_sidebar_layout(
+            area,
+            app.sidebar_section_split,
+            jobs_section_want(&app),
+        );
         let text = row_text(buffer, layout.jobs.y, layout.jobs.width);
         assert!(text.contains("stale"), "header text was {text:?}");
         assert!(text.contains("5m ago"), "header text was {text:?}");
@@ -4828,7 +4907,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -4867,7 +4948,11 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             id: "running".into(),
             label: "Running".into(),
             rows: vec![
-                sample_row("running", &["colliding-job", "1N", "0:01"], RowStyle::Normal),
+                sample_row(
+                    "running",
+                    &["colliding-job", "1N", "0:01"],
+                    RowStyle::Normal,
+                ),
                 sample_row("2", &["other-job", "1N", "0:02"], RowStyle::Normal),
             ],
         };
@@ -4916,7 +5001,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -4944,11 +5031,16 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
-        let columns = jobs_column_rects(row_hit.rect, &crate::config::ListSectionConfig::default().columns);
+        let columns = jobs_column_rects(
+            row_hit.rect,
+            &crate::config::ListSectionConfig::default().columns,
+        );
         // Right-aligned "4N" in a 3-wide column is padded on the left.
         let nodes_col = columns[1];
         let text = row_text(buffer, nodes_col.y, nodes_col.x + nodes_col.width);

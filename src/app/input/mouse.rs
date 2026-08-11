@@ -407,8 +407,7 @@ impl AppState {
                             popup.width.saturating_sub(2),
                             popup.height.saturating_sub(2),
                         );
-                        let (confirm, cancel) =
-                            crate::ui::list_action_confirm_button_rects(inner);
+                        let (confirm, cancel) = crate::ui::list_action_confirm_button_rects(inner);
                         match modal_action_from_buttons(
                             mouse.column,
                             mouse.row,
@@ -593,9 +592,7 @@ impl AppState {
                         } else if self.jobs_mode_toggle_hit(mouse.column, mouse.row) {
                             self.cycle_jobs_mode();
                             return Some(MouseAction::JobsModeToggled);
-                        } else if let Some(hit) =
-                            self.jobs_row_hit_at(mouse.column, mouse.row)
-                        {
+                        } else if let Some(hit) = self.jobs_row_hit_at(mouse.column, mouse.row) {
                             if hit.kind == crate::app::state::JobRowHitKind::Group {
                                 self.toggle_jobs_group_collapsed(&hit.group_id);
                             } else {
@@ -4577,7 +4574,11 @@ mod tests {
         let jobs = app.state.sidebar_layout().jobs;
         assert!(!app.state.jobs.collapsed);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), jobs.x, jobs.y));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            jobs.x,
+            jobs.y,
+        ));
 
         assert!(app.state.jobs.collapsed);
     }
