@@ -44,6 +44,16 @@ else
     echo "  Links may behave differently than documented." >&2
 fi
 
+# --- librt --------------------------------------------------------------------------
+# libghostty-vt's kitty graphics code calls shm_open/shm_unlink. On glibc 2.17 those live
+# in librt; they only moved into libc proper in glibc 2.34, so upstream's toolchains never
+# have to ask for them and build.rs does not emit a link directive for it. Without this the
+# final link fails with "undefined reference to shm_open".
+#
+# Done with RUSTFLAGS rather than a build.rs edit, to keep the branch diff free of
+# upstream-owned files. Appending, so an existing RUSTFLAGS is preserved.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-lrt"
+
 # --- libssp shadow ---------------------------------------------------------------------
 # Juliaup ships its own libssp.so.0 and .bashrc puts it first on LD_LIBRARY_PATH, but it
 # lacks __vsnprintf_chk@LIBSSP_1.0. Any Intel-built binary that needs it dies with a

@@ -7,8 +7,12 @@
 #   1. no undefined C++ runtime / glibc-too-new symbols   (it links at all)
 #   2. no PIC-vs-PIE relocation problem                   (it links as -pie)
 #   3. binutils 2.27 can read an llvm-ar MRI fat archive  (ar/nm read the index)
-#   4. the archive is not stale                           (it prints its embedded version,
-#                                                          which must equal vendor VERSION)
+#   4. nothing calls a post-3.10 syscall                  (it runs without ENOSYS)
+#
+# Staleness is NOT checked here -- that is the vendored-source digest gate in zig-shim.sh.
+# An earlier version of this script compared the reported version against vendor VERSION,
+# which was wrong: the library reports config.lib_version ("0.1.0-dev" by default), not
+# the -Dversion-string value, and the vendored VERSION never appears in the archive.
 #
 # It runs the link twice, with XALT tracking on and off, so XALT interference is isolated
 # here rather than discovered halfway through a cargo build.
@@ -19,7 +23,6 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STAGE_DIR="${HERDR_FRONTERA_PREBUILT:-/work2/08526/jdgeorga/frontera/herdr-build/prebuilt}"
 ARCHIVE="$STAGE_DIR/libghostty-vt.a"
 INCLUDE="$REPO_ROOT/vendor/libghostty-vt/include"
-EXPECT_VERSION=$(cat "$REPO_ROOT/vendor/libghostty-vt/VERSION")
 CC_BIN=${CC:-/opt/apps/gcc/8.3.0/bin/gcc}
 
 fail=0
@@ -46,12 +49,13 @@ cxx=$(printf '%s\n' "$external" | grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind
 # shellcheck disable=SC2086
 if [ -z "$cxx" ]; then good "none"; else bad "found:"; printf '     %s\n' $cxx; fi
 
-note "external symbols all resolvable against Frontera's glibc 2.17"
+note "external symbols all resolvable against Frontera's glibc 2.17 (libc/m/pthread/dl/rt)"
 undef="$external"
 defined=$( { /usr/bin/nm -D --defined-only /usr/lib64/libc.so.6 2>/dev/null
              /usr/bin/nm -D --defined-only /usr/lib64/libm.so.6 2>/dev/null
              /usr/bin/nm -D --defined-only /usr/lib64/libpthread.so.0 2>/dev/null
              /usr/bin/nm -D --defined-only /usr/lib64/libdl.so.2 2>/dev/null
+             /usr/bin/nm -D --defined-only /usr/lib64/librt.so.1 2>/dev/null
            } | awk '{print $3}' | sed 's/@@.*//;s/@.*//' | sort -u)
 missing=$(comm -23 <(echo "$undef") <(echo "$defined") | grep -v '^$' || true)
 if [ -z "$missing" ]; then
@@ -59,7 +63,7 @@ if [ -z "$missing" ]; then
 else
     printf '   unresolved-by-libc (may be intra-archive, the link below is authoritative):\n'
     # deliberate word split below: one symbol per line
-# shellcheck disable=SC2086
+    # shellcheck disable=SC2086
     printf '     %s\n' $missing | head -20
 fi
 
@@ -83,16 +87,18 @@ EOF
 for tracking in yes no; do
     note "link + run with XALT_EXECUTABLE_TRACKING=$tracking"
     out="${TMPDIR:-/tmp}/herdr_link_probe.$tracking"
+    # -lrt is REQUIRED on this host: the kitty graphics code calls shm_open/shm_unlink,
+    # which live in librt on glibc 2.17. They only moved into libc proper in glibc 2.34,
+    # so upstream's modern toolchains never need to ask for it.
     if XALT_EXECUTABLE_TRACKING=$tracking "$CC_BIN" -fPIE -pie -O1 \
             -I "$INCLUDE" "${TMPDIR:-/tmp}/herdr_link_probe.c" "$ARCHIVE" \
-            -lm -lpthread -ldl -o "$out" 2>"${TMPDIR:-/tmp}/herdr_link_probe.$tracking.err"; then
+            -lm -lpthread -ldl -lrt -o "$out" 2>"${TMPDIR:-/tmp}/herdr_link_probe.$tracking.err"; then
         good "linked"
         if got=$(XALT_EXECUTABLE_TRACKING=$tracking "$out" 2>&1); then
-            if [ "$got" = "$EXPECT_VERSION" ]; then
-                good "ran, reported '$got' (matches vendor VERSION)"
-            else
-                bad "version mismatch: archive says '$got', vendor VERSION says '$EXPECT_VERSION' -- STALE ARCHIVE"
-            fi
+            # Do NOT compare this against vendor/libghostty-vt/VERSION. This reports
+            # config.lib_version (-Dlib-version-string, default "0.1.0-dev"), not
+            # -Dversion-string. Staleness is the digest gate's job, not this probe's.
+            good "ran, reported lib version '$got'"
         else
             bad "linked but crashed at runtime: $got"
             echo "     (if this is ENOSYS, the library touches a syscall kernel 3.10 lacks)"
