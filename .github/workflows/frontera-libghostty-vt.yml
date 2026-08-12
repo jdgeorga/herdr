@@ -74,18 +74,31 @@ jobs:
             -Demit-xcframework=false
           ls -la zig-out/lib/
 
-      - name: Gate -- no C++ runtime symbols left undefined
+      - name: Gate -- nothing external left unresolved
         working-directory: vendor/libghostty-vt
         run: |
           set -euo pipefail
-          nm --undefined-only --format=posix zig-out/lib/libghostty-vt.a \
-            | awk '{print $1}' | sort -u > /tmp/undef.txt
-          if grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind_|_Znwm|_ZdlPv)' /tmp/undef.txt; then
-            echo "::error::archive needs a C++ runtime; it will not link on Frontera"
+          export LC_ALL=C
+          A=zig-out/lib/libghostty-vt.a
+          # `nm --undefined-only` on an ARCHIVE reports per-member undefineds, including
+          # symbols another member of the same archive defines (simdutf's and highway's
+          # own C++ functions show up this way). Subtract the archive's own defined set
+          # before judging anything, or every intra-archive reference is a false positive.
+          nm --undefined-only --format=posix "$A" | awk '{print $1}' | sort -u > /tmp/undef.txt
+          nm --defined-only   --format=posix "$A" | awk '{print $1}' | sort -u > /tmp/def.txt
+          comm -23 /tmp/undef.txt /tmp/def.txt > /tmp/external.txt
+          echo "undefined=$(wc -l < /tmp/undef.txt) defined=$(wc -l < /tmp/def.txt) external=$(wc -l < /tmp/external.txt)"
+
+          # A genuinely EXTERNAL C++ symbol means the final link needs libstdc++/libc++.
+          # Frontera links with a plain C toolchain, so that would not resolve.
+          if grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind_)' /tmp/external.txt; then
+            echo "::error::archive needs an external C++ runtime; it will not link on Frontera"
             exit 1
           fi
-          echo "no C++ runtime symbols -- ok"
-          cp /tmp/undef.txt libghostty-vt.undefined-symbols.txt
+          echo "no external C++ runtime dependency -- ok"
+          echo "--- external symbols the final link must satisfy ---"
+          cat /tmp/external.txt
+          cp /tmp/external.txt libghostty-vt.undefined-symbols.txt
 
       - name: Write provenance
         working-directory: vendor/libghostty-vt
