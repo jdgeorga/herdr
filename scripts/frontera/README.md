@@ -116,10 +116,10 @@ That path is not arbitrary — it matches `site/bin/herdr-slurm:113` exactly, so
 and the site launcher agree on one socket per host. Diverging would hide sessions from
 `herdr ls`, which discovers them by that path.
 
-`herdr-attach.sh` does this, and a `herdr()` function in `~/.bashrc` does it for bare
-invocations — which matters, because `herdr-attach` only protects the paths that go through it,
-and a bare `herdr` would otherwise still use the `/home1` socket. The client socket is derived
-from the API socket, so one variable covers both.
+After `site/install.sh --link-herdr`, `site/bin/herdr-slurm` does this for you on every
+invocation, so `herdr-attach.sh` simply defers to it. The `herdr()` function in `~/.bashrc`
+computes the same path as a belt-and-braces for any invocation that somehow bypasses the
+launcher. The client socket is derived from the API socket, so one variable covers both.
 
 **Never relocate the data dir with `XDG_CONFIG_HOME`.** This was tried and it backfired badly.
 The variable is not herdr-specific, and **herdr exports its whole environment into every pane** —
@@ -135,9 +135,12 @@ work.
 
 Two more things worth knowing:
 
-- **Do not pass `--session`.** `active_api_socket_path()` checks `explicit_session_requested()`
-  **before** consulting the environment, so naming a session discards `HERDR_SOCKET_PATH` and
-  puts the socket back on Lustre.
+- **Avoid the `--session` FLAG** — but the `HERDR_SESSION` env var is fine. `src/session.rs:80`
+  sets `EXPLICIT_SESSION_REQUESTED` only for the flag, and `active_api_socket_path()` checks
+  that before the environment, so the flag would drag the socket back onto Lustre. Line 82
+  checks `HERDR_SOCKET_PATH` *first* and stores `false`, which is why the launcher's
+  `HERDR_SESSION=slurm-<host>` is safe — and it gives per-host durable state under
+  `~/.config/herdr/sessions/`, which is better than one shared `session.json`.
 - **Prefer one server with several workspaces** over several servers. herdr already has
   workspaces and tabs. Multiple servers share one `~/.config/herdr/session.json`, so the last
   one to save wins the layout — an annoyance, not corruption, but avoidable.
