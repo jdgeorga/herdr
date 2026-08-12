@@ -34,14 +34,20 @@ if /usr/bin/ar t "$ARCHIVE" >/dev/null 2>&1; then good "/usr/bin/ar t"; else bad
 if /usr/bin/nm --print-armap "$ARCHIVE" >/dev/null 2>&1; then good "/usr/bin/nm --print-armap"; else bad "/usr/bin/nm cannot read the symbol index"; fi
 printf '   members: %s\n' "$(/usr/bin/ar t "$ARCHIVE" 2>/dev/null | wc -l)"
 
-note "no C++ runtime symbols left undefined"
-cxx=$(/usr/bin/nm --undefined-only --format=posix "$ARCHIVE" 2>/dev/null \
-      | awk '{print $1}' \
-      | grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind_|_Znwm|_ZdlPv)' | sort -u || true)
+note "no EXTERNAL C++ runtime dependency"
+# Subtract the archive's own defined symbols first: `nm --undefined-only` on an archive
+# reports per-member undefineds, so simdutf's and highway's own C++ functions appear
+# undefined even though a sibling member defines them. Only what survives is external.
+undef=$(/usr/bin/nm --undefined-only --format=posix "$ARCHIVE" 2>/dev/null | awk '{print $1}' | sort -u)
+defined=$(/usr/bin/nm --defined-only --format=posix "$ARCHIVE" 2>/dev/null | awk '{print $1}' | sort -u)
+external=$(comm -23 <(echo "$undef") <(echo "$defined"))
+cxx=$(printf '%s\n' "$external" | grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind_)' || true)
+# deliberate word split below: one symbol per line
+# shellcheck disable=SC2086
 if [ -z "$cxx" ]; then good "none"; else bad "found:"; printf '     %s\n' $cxx; fi
 
-note "undefined glibc symbols all resolvable against Frontera's glibc 2.17"
-undef=$(/usr/bin/nm --undefined-only --format=posix "$ARCHIVE" 2>/dev/null | awk '{print $1}' | sort -u)
+note "external symbols all resolvable against Frontera's glibc 2.17"
+undef="$external"
 defined=$( { /usr/bin/nm -D --defined-only /usr/lib64/libc.so.6 2>/dev/null
              /usr/bin/nm -D --defined-only /usr/lib64/libm.so.6 2>/dev/null
              /usr/bin/nm -D --defined-only /usr/lib64/libpthread.so.0 2>/dev/null
@@ -52,6 +58,8 @@ if [ -z "$missing" ]; then
     good "every external symbol is present in glibc 2.17"
 else
     printf '   unresolved-by-libc (may be intra-archive, the link below is authoritative):\n'
+    # deliberate word split below: one symbol per line
+# shellcheck disable=SC2086
     printf '     %s\n' $missing | head -20
 fi
 
