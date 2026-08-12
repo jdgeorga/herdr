@@ -70,9 +70,12 @@ Its server persists on the compute node for the life of the allocation.
 scripts/frontera/herdr-attach.sh          # from any login node; resolves your job's node
 ```
 
-That is the herdr counterpart to `idev-attach`, which does the same thing for tmux. Same job
-auto-selection (the only RUNNING job, else the `idv*` one), same `-n/--dry-run` and `-j JOBID`
-flags. Symlink it if you want it on `PATH`:
+It does exactly one thing: resolve which node your idev job is on, ssh there, and run
+`herdr`. It is transport only — socket, session and config all belong to
+`site/bin/herdr-slurm` on the far side, so the two can never disagree. Same job
+auto-selection as `idev-attach` (the only RUNNING job, else the `idv*` one), same
+`-n/--dry-run` and `-j JOBID`, plus `-- ARGS...` passed through to `herdr`. Symlink it if
+you want it on `PATH`:
 
 ```bash
 ln -sf ~/herdr/scripts/frontera/herdr-attach.sh ~/.local/bin/herdr-attach
@@ -254,7 +257,7 @@ were folded into `site/`.
 | `fetch-artifact.sh` | Downloads the CI archive to `/work2`, rejects it if provenance disagrees. |
 | `link-probe.sh` | 30-second go/no-go gate. Run before any full build. |
 | `provenance.json` | The committed expectation the shim checks against. |
-| `herdr-attach.sh` | Attach to herdr on the job's compute node, with a node-local socket. |
+| `herdr-attach.sh` | Transport only: login node -> the job's compute node, then runs `herdr`. |
 | `site.env` | Frontera values for `site/lib/herdr-site.sh` (python, login prefix, fork bin). |
 | `python3-frontera.sh` | Interpreter for the jobs provider; fixes libssp + Intel runtime. |
 | `frontera-limits.sh` | The limits that actually bite here; `herdr health` cannot see them. |
