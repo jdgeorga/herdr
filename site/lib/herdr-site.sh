@@ -74,9 +74,14 @@ _herdr_site_load_env_file() {
 
   # site.env must not be able to override a value the caller set explicitly on
   # the command line or in its own environment; restore those afterwards.
-  for kv in "${preset[@]}"; do
-    export "${kv?}"
-  done
+  # bash < 4.4 (CentOS 7 ships 4.2) treats "${arr[@]}" on an EMPTY array as an
+  # unbound variable under `set -u`, so this needs the same count guard used
+  # elsewhere in this file. Without it every site/bin command aborts at startup.
+  if (( ${#preset[@]} > 0 )); then
+    for kv in "${preset[@]}"; do
+      export "${kv?}"
+    done
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -240,7 +245,14 @@ herdr_site_hosts() {
   if (( ${#HERDR_SITE_SEEN[@]} == 0 )); then
     herdr_site_discover_hosts
   fi
-  mapfile -t HERDR_SITE_HOSTS < <(printf '%s\n' "${!HERDR_SITE_SEEN[@]}" | sort -V)
+  # Same bash < 4.4 caveat, plus: printf '%s\n' with no argument still emits one
+  # blank line, which mapfile turns into a phantom empty host and pids[""] then
+  # fails with "bad array subscript". Guard on the count instead.
+  if (( ${#HERDR_SITE_SEEN[@]} > 0 )); then
+    mapfile -t HERDR_SITE_HOSTS < <(printf '%s\n' "${!HERDR_SITE_SEEN[@]}" | sort -V)
+  else
+    HERDR_SITE_HOSTS=()
+  fi
 }
 
 # Absolute path to a sibling wrapper. Used both for local dispatch and for the
