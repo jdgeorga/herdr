@@ -55,6 +55,51 @@ cargo build --release --locked -j 24
 Never on a login node: `ulimit -u` there is 300 and counts **threads**, so parallel rustc
 trips it and reports misleading errors (`WouldBlock`, `EAGAIN`).
 
+Put the binary on `PATH` once, as a symlink, so rebuilds need no reinstall step:
+
+```bash
+ln -sf /work2/08526/jdgeorga/frontera/herdr-build/target/release/herdr ~/.local/bin/herdr
+```
+
+## Running it
+
+herdr is itself a multiplexer, so it **replaces** tmux here rather than running inside it.
+Its server persists on the compute node for the life of the allocation.
+
+```bash
+scripts/frontera/herdr-attach.sh          # from any login node; resolves your job's node
+```
+
+That is the herdr counterpart to `idev-attach`, which does the same thing for tmux. Same job
+auto-selection (the only RUNNING job, else the `idv*` one), same `-n/--dry-run` and `-j JOBID`
+flags. Symlink it if you want it on `PATH`:
+
+```bash
+ln -sf ~/herdr/scripts/frontera/herdr-attach.sh ~/.local/bin/herdr-attach
+```
+
+Two things it handles that a naive `ssh node herdr` does not:
+
+- **The socket must be node-local.** herdr defaults to `~/.config/herdr/herdr.sock`, and
+  `/home1` is Lustre — shared across every login and compute node. A socket file visible from
+  a host where the server process does not exist is exactly the failure mode that bites
+  `tailscaled` here: a liveness check on a sibling node sees the file, concludes nothing is
+  running, and starts a second server against the same state. The script points
+  `HERDR_SOCKET_PATH` at `/tmp`.
+- **It must not pass `--session`.** In `src/session.rs`, `active_api_socket_path()` checks
+  `explicit_session_requested()` **before** reading `HERDR_SOCKET_PATH`, so naming a session
+  silently discards the override and puts the socket back on Lustre. Distinct socket paths
+  give the same effect; the client socket is derived from the API socket, so one variable is
+  enough.
+
+Inherited caveat, same as `idev-attach`: a server started cold over ssh gets a bare login
+environment — 0 `SLURM_*` vars, versus 41 in one started from inside the job step — so its
+panes cannot run `ibrun`/`srun`. The script warns and continues. For job-aware panes, start
+herdr from inside the job shell.
+
+Run herdr on one host at a time. The socket is node-local now, but the state directory under
+`~/.config/herdr` is still on shared `/home1`.
+
 ## The SLURM sidebar
 
 `scripts/herdr-jobs.py` was written for NERSC but runs on Frontera **unmodified** — verified
@@ -83,9 +128,91 @@ Two Frontera facts drive the wrapper:
 | `fetch-artifact.sh` | Downloads the CI archive to `/work2`, rejects it if provenance disagrees. |
 | `link-probe.sh` | 30-second go/no-go gate. Run before any full build. |
 | `provenance.json` | The committed expectation the shim checks against. |
+| `herdr-attach.sh` | Attach to herdr on the job's compute node, with a node-local socket. |
 | `herdr-jobs-frontera.sh` | Interpreter wrapper for the SLURM sidebar. |
 | `config.frontera.toml` | Sidebar config pointing at the wrapper. |
 | `build.slurm` | sbatch wrapper (`normal` queue, not `development`). |
+
+## Updating and rebasing
+
+This branch is designed to be rebased onto upstream indefinitely. Its entire diff is new files
+under `scripts/frontera/`, one workflow, and one spec — **no upstream-owned file is modified** —
+so a rebase can only conflict on a file this branch created.
+
+### Routine rebase
+
+```bash
+git fetch upstream
+git rebase upstream/master          # or: git rebase origin/feat/slurm-jobs-sidebar
+source scripts/frontera/env.sh
+cargo build --release --locked -j 24
+```
+
+If the rebase pulled in a new `vendor/libghostty-vt`, that build stops immediately with a
+digest mismatch. That is the system working; see the next section.
+
+### Refreshing the prebuilt archive
+
+Needed whenever `vendor/libghostty-vt/**` changes. Four steps, and the shim's error message
+prints them:
+
+```bash
+# 1. push; CI rebuilds the archive and publishes it to the fork release
+git push origin herdr-slurm-frontera
+
+# 2. record what CI produced -- a deliberate, reviewed commit, never automated
+gh release download frontera-libghostty-vt --repo jdgeorga/herdr \
+   --pattern provenance.json --dir /tmp
+cp /tmp/provenance.json scripts/frontera/provenance.json
+git diff scripts/frontera/provenance.json      # read it before committing
+git commit -am 'chore(frontera): refresh libghostty-vt provenance'
+
+# 3. stage it on /work2 (refuses if the two provenance copies disagree)
+scripts/frontera/fetch-artifact.sh
+
+# 4. prove it links before a full build
+scripts/frontera/link-probe.sh
+```
+
+### What CI does and does not rebuild
+
+The archive is **not bit-reproducible** — it embeds runner paths, so two builds of identical
+source differ byte for byte. If every push republished, the `archive_sha256` committed here
+would be invalidated constantly and `fetch-artifact.sh` would fail for no real reason.
+
+So the workflow keys publication on the **vendored source**, not the commit: it compares the
+published provenance's `vendor_tree_sha256` against the current tree and skips the build and
+upload entirely when they match. Zig is not even installed on that path. A push that does not
+touch `vendor/libghostty-vt/**` finishes in about 6 seconds.
+
+Consequence worth knowing: **you cannot force a rebuild by pushing again.** To genuinely
+replace the artifact, delete the release asset (or the whole `frontera-libghostty-vt` release)
+and push, or use `workflow_dispatch` after removing the published `provenance.json`.
+
+### Keeping the two digests in sync
+
+`zig-shim.sh` and the workflow compute the vendored-source digest independently. They must
+agree exactly, and two details make that fragile — if you touch either copy, preserve both:
+
+- `LC_ALL` must be **exported**, not used as a command prefix. `LC_ALL=C find … | sort` applies
+  the locale only to `find`, leaving `sort` under the ambient locale; the two forms produce
+  different digests on this tree.
+- Generated directories must be **pruned** (`zig-out`, `.zig-cache`). The shim stages the
+  archive into `vendor/libghostty-vt/zig-out/`, which would otherwise be inside the hashed
+  tree and change the digest on the very next build.
+
+### Upstream hygiene
+
+Never push branches or tags to the `upstream` remote, and never open a PR or issue against
+`herdrdev/herdr`. `git remote -v` has `upstream` configured, so a mistyped push target is a
+live hazard. `CONTRIBUTING.md` auto-closes unsolicited PRs. Everything here belongs on the
+`jdgeorga/herdr` fork.
+
+### If `build.rs` stops honouring `ZIG`
+
+The whole mechanism rests on `build.rs` reading `env::var("ZIG")` and only asserting the child
+exits 0. If upstream changes that, the shim stops being consulted and nothing announces it. The
+regression test below is the detector: if it stops failing, the guard is gone.
 
 ## When a build suddenly refuses to start
 
