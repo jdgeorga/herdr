@@ -42,9 +42,17 @@
 # destructive shared-socket case is what the node-local socket fixes. herdr has workspaces
 # and tabs, so prefer ONE server with several workspaces over several servers.
 #
-# We deliberately do NOT pass --session. In src/session.rs, active_api_socket_path()
-# checks explicit_session_requested() FIRST and returns a config-dir path, so naming a
-# session would bypass the relocation. Distinct XDG dirs give the same effect.
+# Socket, session and config are left to site/bin/herdr-slurm, which ~/.local/bin/herdr
+# points at after `site/install.sh --link-herdr`. It sets HERDR_SOCKET_PATH to a per-host
+# /tmp dir, HERDR_SESSION to slurm-<host> (durable per-host state under
+# ~/.config/herdr/sessions/), and HERDR_CONFIG_PATH to ~/.config/herdr-slurm/config.toml.
+# Forcing our own socket here would diverge from that and hide the session from `herdr ls`.
+#
+# Note the --session FLAG is still the thing to avoid: src/session.rs:80 sets
+# EXPLICIT_SESSION_REQUESTED only for the flag, and active_api_socket_path() checks it
+# before the environment, which would drag the socket back onto Lustre. The HERDR_SESSION
+# env var the launcher uses is explicitly safe -- line 82 checks HERDR_SOCKET_PATH first
+# and stores false.
 #
 # Caveat inherited from idev-attach: a server born from THIS ssh gets a bare login
 # environment (measured: 0 SLURM_* vars, versus 41 in a server started from inside
@@ -124,19 +132,16 @@ printf 'job %s (%s): %s, %s left' "$jobid" "$jname" "$node" "$left"
 [ "$nnodes" -gt 1 ] && printf ' [+%d more: %s]' "$((nnodes - 1))" "$nodelist"
 printf '\n'
 
-SOCK="/tmp/herdr-$USER-$NAME.sock"
-
 # Absolute path rather than `ssh -t node bash -lc`: sourcing .bashrc on a compute node
 # fires start-tailscaled.sh, whose owner lockfile then refuses and prints noise on every
 # reconnect. The heredoc is QUOTED so $HOME/$USER are expanded by the REMOTE shell.
 remote="$(cat <<'EOF'
-export HERDR_SOCKET_PATH="__SOCK__"
 if [ ! -x "__BIN__" ]; then
     echo "herdr-attach: no herdr at __BIN__ on $(hostname -s)" >&2
     echo "  build it first:  cd ~/herdr && source scripts/frontera/env.sh && cargo build --release" >&2
     exit 127
 fi
-if [ ! -S "$HERDR_SOCKET_PATH" ]; then
+if [ ! -S "${TMPDIR:-/tmp}/herdr-slurm-$USER-$(hostname -s)/herdr.sock" ]; then
     echo "herdr-attach: starting a new server cold over ssh -- its panes will have NO" >&2
     echo "  SLURM_* env, so ibrun/srun/mpirun will not work in them. For job-aware panes," >&2
     echo "  run herdr from inside the job shell instead." >&2
@@ -145,14 +150,12 @@ fi
 exec "__BIN__"
 EOF
 )"
-remote="${remote//__SOCK__/$SOCK}"
 remote="${remote//__BIN__/$HERDR_BIN}"
 
 if [ "$DRY" -eq 1 ]; then
-    echo "socket: $SOCK  (node-local /tmp, NOT a shared filesystem)"
-    echo "state:  $HOME/.config/herdr  (default; durable, survives the job)"
+    echo "socket/session/config: delegated to site/bin/herdr-slurm on the target host"
     if [ "$(hostname -s)" = "$node" ]; then
-        echo "would run locally: HERDR_SOCKET_PATH=$SOCK $HERDR_BIN"
+        echo "would run locally: $HERDR_BIN"
     else
         echo "would run: ssh -t $node <<'---'"
         printf '%s\n' "$remote" | sed 's/^/  /'
@@ -167,7 +170,6 @@ if [ -n "${TMUX:-}" ]; then
 fi
 
 if [ "$(hostname -s)" = "$node" ]; then
-    export HERDR_SOCKET_PATH="$SOCK"
     exec "$HERDR_BIN"
 fi
 

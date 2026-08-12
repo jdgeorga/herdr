@@ -166,8 +166,18 @@ node-local and host-keyed. Everything Frontera needs is supplied through its own
 ```bash
 mkdir -p ~/.config/herdr-slurm
 ln -sf ~/herdr/scripts/frontera/site.env ~/.config/herdr-slurm/site.env
-herdr site        # shows every resolved value and where it came from
+site/install.sh --dry-run --link-herdr     # read this first
+site/install.sh --link-herdr               # then install
+herdr site                                 # every resolved value + its source
 ```
+
+**`--link-herdr` is not optional.** It defaults to `0`, and without it `~/.local/bin/herdr`
+keeps pointing at the raw binary — which reads `~/.config/herdr/config.toml`, not the
+`~/.config/herdr-slurm/config.toml` the installer symlinks. Only `site/bin/herdr-slurm` sets
+`HERDR_CONFIG_PATH`, so your config is silently ignored until `herdr` *is* the launcher.
+Confirm with `tr '\0' '\n' < /proc/$(pgrep -u $USER -x herdr | tail -1)/environ | grep HERDR_CONFIG_PATH`;
+note `herdr --help` will not show it, because that case execs at `herdr-slurm:79`, before the
+export at line 91.
 
 Three probes get Frontera wrong, and `site.env` corrects all three without patching `site/`:
 

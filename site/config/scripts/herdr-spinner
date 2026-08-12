@@ -57,10 +57,18 @@ case "${1:-start}" in
     # Fully detach: a hook that starts this must not wait on the daemon, and
     # the daemon must survive the pane that launched it. If this races another
     # start, the loser exits on the flock.
+    # Prefer the site-resolved interpreter over bare python3, the way herdr-jobs
+    # does. herdr-slurm exports HERDR_SITE_PYTHON, so it is present in every pane.
+    # On Frontera bare python3 is whichever module happens to be on PATH -- often
+    # the Intel build, which dies with a libssp relocation error unless gcc's
+    # libssp.so.0 precedes Juliaup's on LD_LIBRARY_PATH. That ordering holds in a
+    # normal login shell but not in a server started cold over ssh, so keying off
+    # PATH makes the spinner fail intermittently and invisibly.
+    _py="${HERDR_SITE_PYTHON:-python3}"
     if command -v setsid >/dev/null 2>&1; then
-      setsid python3 "$daemon" </dev/null >>"$log_file" 2>&1 &
+      setsid "$_py" "$daemon" </dev/null >>"$log_file" 2>&1 &
     else
-      nohup python3 "$daemon" </dev/null >>"$log_file" 2>&1 &
+      nohup "$_py" "$daemon" </dev/null >>"$log_file" 2>&1 &
     fi
     ;;
   stop)
