@@ -6,6 +6,9 @@
 #
 # or merge the [ui.sidebar.list] section into an existing config.toml.
 #
+# Ships with the list expanded (collapsed = false) -- verified rendering live SLURM rows
+# on 2026-08-11. Set it back to true if you would rather it start folded.
+#
 # The `command` below points at the Frontera interpreter wrapper rather than at python
 # directly. Frontera has no /usr/bin/python3.11; /usr/bin/python3 is 3.6.8 and cannot parse
 # the provider. See scripts/frontera/herdr-jobs-frontera.sh for why the wrapper exists.
@@ -17,7 +20,7 @@
 [ui.sidebar.list]
 enabled = true
 placement = "bottom"
-collapsed = true
+collapsed = false
 refresh_seconds = 10
 timeout_seconds = 5
 max_visible_rows = 12
