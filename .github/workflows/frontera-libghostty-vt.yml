@@ -36,11 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.2
-
       - name: Compute vendored-source digest
         id: digest
         run: |
@@ -57,7 +52,37 @@ jobs:
           echo "version_string=$(cat vendor/libghostty-vt/VERSION)" >> "$GITHUB_OUTPUT"
           echo "digest: $d"
 
+      - name: Skip if an artifact for this exact source tree is already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The archive is NOT bit-reproducible -- it embeds runner paths, so every rebuild
+          # produces different bytes. Republishing on an unrelated push would therefore
+          # invalidate the archive_sha256 committed in scripts/frontera/provenance.json and
+          # break fetch-artifact.sh for no reason. Key the artifact on the vendored SOURCE:
+          # if the tree digest is unchanged, the published archive is already correct.
+          published=""
+          if gh release download "$RELEASE_TAG" --pattern provenance.json --dir /tmp/pub 2>/dev/null; then
+            published=$(python3 -c "import json;print(json.load(open('/tmp/pub/provenance.json')).get('vendor_tree_sha256',''))")
+          fi
+          if [ -n "$published" ] && [ "$published" = "${{ steps.digest.outputs.vendor_tree_sha256 }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Published artifact already matches this source tree ($published) -- nothing to do."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Need a build: published='${published:-<none>}' current='${{ steps.digest.outputs.vendor_tree_sha256 }}'"
+          fi
+
+      - name: Install zig
+        if: steps.check.outputs.skip != 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
       - name: Build libghostty-vt.a
+        if: steps.check.outputs.skip != 'true'
         working-directory: vendor/libghostty-vt
         run: |
           set -euo pipefail
@@ -75,6 +100,7 @@ jobs:
           ls -la zig-out/lib/
 
       - name: Gate -- nothing external left unresolved
+        if: steps.check.outputs.skip != 'true'
         working-directory: vendor/libghostty-vt
         run: |
           set -euo pipefail
@@ -101,6 +127,7 @@ jobs:
           cp /tmp/external.txt libghostty-vt.undefined-symbols.txt
 
       - name: Write provenance
+        if: steps.check.outputs.skip != 'true'
         working-directory: vendor/libghostty-vt
         run: |
           set -euo pipefail
@@ -136,6 +163,7 @@ jobs:
           VENDOR_TREE_SHA256: ${{ steps.digest.outputs.vendor_tree_sha256 }}
 
       - name: Publish as a release asset
+        if: steps.check.outputs.skip != 'true'
         working-directory: vendor/libghostty-vt
         env:
           GH_TOKEN: ${{ github.token }}
@@ -143,11 +171,17 @@ jobs:
           set -euo pipefail
           # A release asset, not an actions artifact: this repo's upload steps set
           # retention-days: 7, and Frontera needs to re-fetch this long after that.
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+          # Idempotent, and race-safe. `view || create` is check-then-act: two runs pushed
+          # seconds apart both saw no release and both tried to create it, and the loser got
+          # "HTTP 422: Release.tag_name already exists". Tolerate the 422, then confirm.
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --title "libghostty-vt.a for Frontera (glibc 2.17)" \
               --notes "Prebuilt static archive for building herdr on TACC Frontera, where zig cannot run. Consumed by scripts/frontera/fetch-artifact.sh. Regenerated automatically; see the attached provenance.json for the exact source tree and flags." \
-              --prerelease
+              --prerelease || true
+            gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
+              || { echo "::error::release $RELEASE_TAG could not be created or found"; exit 1; }
+          fi
           gh release upload "$RELEASE_TAG" \
             zig-out/lib/libghostty-vt.a \
             provenance.json \
@@ -155,6 +189,7 @@ jobs:
             --clobber
 
       - name: Next steps
+        if: steps.check.outputs.skip != 'true'
         run: |
           echo "Archive published to release '$RELEASE_TAG'."
           echo "On Frontera:"
