@@ -109,8 +109,12 @@ servers at once.
 The fix is to relocate **only the socket**:
 
 ```bash
-HERDR_SOCKET_PATH=/tmp/herdr-$USER-default.sock herdr
+HERDR_SOCKET_PATH="${TMPDIR:-/tmp}/herdr-slurm-$USER-$(hostname -s)/herdr.sock" herdr
 ```
+
+That path is not arbitrary — it matches `site/bin/herdr-slurm:113` exactly, so a bare `herdr`
+and the site launcher agree on one socket per host. Diverging would hide sessions from
+`herdr ls`, which discovers them by that path.
 
 `herdr-attach.sh` does this, and a `herdr()` function in `~/.bashrc` does it for bare
 invocations — which matters, because `herdr-attach` only protects the paths that go through it,
@@ -151,24 +155,82 @@ Verified 2026-08-12: killed the server, deleted both sockets, restarted — herd
 ends, starting herdr on the next node brings back the workspace/tab/pane layout and puts each
 shell back in its directory.
 
-## The SLURM sidebar
+## The `site/` tooling on Frontera
 
-`scripts/herdr-jobs.py` was written for NERSC but runs on Frontera **unmodified** — verified
-against Slurm 23.11 in both `live` and `history` modes, and `--selftest` passes. It only needs
-the right interpreter, which is what `herdr-jobs-frontera.sh` provides.
+`site/` (on `feat/slurm-jobs-sidebar`) provides `herdr health`, `herdr ls`, `herdr cleanup`,
+`herdr reap` and the tracked sidebar config. It is portable by design, and its socket handling
+is already right for Frontera: `_rt="${TMPDIR:-/tmp}/herdr-slurm-${USER}-$this_host"` is
+node-local and host-keyed. Everything Frontera needs is supplied through its own knobs, in
+`scripts/frontera/site.env`:
 
 ```bash
-cp scripts/frontera/config.frontera.toml ~/.config/herdr/config.toml
-scripts/frontera/herdr-jobs-frontera.sh --mode live      # should print one JSON object
+mkdir -p ~/.config/herdr-slurm
+ln -sf ~/herdr/scripts/frontera/site.env ~/.config/herdr-slurm/site.env
+herdr site        # shows every resolved value and where it came from
 ```
 
-Two Frontera facts drive the wrapper:
+Three probes get Frontera wrong, and `site.env` corrects all three without patching `site/`:
 
-- **Python.** The provider needs >= 3.7 (`from __future__ import annotations`).
-  `/usr/bin/python3` is 3.6.8 and cannot parse it. `python3/3.9.2` works.
-- **libssp.** Juliaup ships its own `libssp.so.0`, `.bashrc` puts it first on
-  `LD_LIBRARY_PATH`, and it lacks `__vsnprintf_chk@LIBSSP_1.0` — so every Intel-built python
-  dies with a relocation error. gcc 8.3.0's `lib64` has the working copy and must come first.
+| Probe | Gets | Why it is wrong here |
+|---|---|---|
+| `HERDR_SITE_PYTHON` | *unresolved* | Gate is `>= 3.11`; Frontera's newest module is **3.9.2**. The provider runs fine on 3.9.2 — both modes and `--selftest` verified — and cannot run on 3.6.8 at all. |
+| `HERDR_SITE_LOGIN_PREFIX` | `c` | Derived from `hostname -s` stripped at the first digit. From compute node `c101-212` that yields `c`, so real login nodes are rejected. |
+| `HERDR_SITE_FORK_BIN` | `$REPO/target/release/herdr` | The build tree is on `/work2`; `/home1` is at ~85% of its inode quota. |
+
+Set **both** `LOGIN_PREFIX` and `LOGIN_PATTERN`. The pattern is probed independently, so
+overriding the prefix alone leaves a stale pattern and the override silently does nothing.
+
+`HERDR_SITE_PYTHON` points at `python3-frontera.sh`, not at the interpreter, because the module
+python cannot start from a bare path: it is Intel-built and needs its own lib dir plus the
+Intel runtime, and Juliaup's `libssp.so.0` (which lacks `__vsnprintf_chk@LIBSSP_1.0`) must lose
+to gcc 8.3.0's copy — `/usr/lib64` has none at all.
+
+### Two bash 4.2 fixes in `site/lib/herdr-site.sh`
+
+Frontera is CentOS 7 with **bash 4.2.46**, where `set -u` plus `"${empty_array[@]}"` is an
+"unbound variable" error; that was fixed in bash 4.4. All seven `site/bin` commands aborted at
+startup. Both fixes use the `(( ${#arr[@]} > 0 ))` guard already used elsewhere in that file:
+
+- `preset` in `_herdr_site_load_env_file` — the crash every command hit.
+- `HERDR_SITE_SEEN` in the host-list builder. `printf '%s\n'` with no argument still emits one
+  blank line, so `mapfile` produced a phantom empty host and `pids[""]` failed with "bad array
+  subscript".
+
+These are the only edits this branch makes to a file it does not own.
+
+### `herdr health` is blind on Frontera — use `frontera-limits.sh`
+
+`herdr health` reads cgroup memory/pids. Frontera is cgroup v1 with an unreadable per-user
+slice, so `site/lib/herdr-site.sh` warns and the columns come back zeroed — it reported
+`MEMORY 0K / TASKS 0 / TASKLIMIT max` for a login node that was actually at **166 of 300
+threads**. A health check that reads "fine" at the ceiling is worse than none.
+
+```bash
+scripts/frontera/frontera-limits.sh          # this host + login1-4
+```
+
+Frontera enforces with `ulimit`, not cgroups: `ulimit -u` is 300 on login nodes and 4096 on
+compute nodes and counts **threads**, and `ulimit -v` caps each process at 8 GB on login nodes.
+A single `claude` runs ~5–8 GB of VSZ, so on a login node it sits at or over that cap — which
+is why servers there were being killed with nothing logged.
+
+### The sidebar provider
+
+`scripts/herdr-jobs.py` was written for NERSC but runs on Frontera **unmodified** — verified
+against Slurm 23.11 in both `live` and `history` modes, with `--selftest` passing. It needs
+only the right interpreter, which `site.env` now supplies. Point the sidebar at the tracked
+shim:
+
+```bash
+ln -sfn ~/herdr/site/config/scripts/herdr-jobs ~/.config/herdr/scripts/herdr-jobs
+ln -sfn ~/herdr/scripts/herdr-jobs.py          ~/.config/herdr/scripts/herdr-jobs.py
+# then in config.toml:
+#   command = ["~/.config/herdr/scripts/herdr-jobs", "--mode", "{mode}"]
+~/.config/herdr/scripts/herdr-jobs --mode live   # should print one JSON object
+```
+
+This branch no longer carries its own copy of the provider shim or the sidebar config; both
+were folded into `site/`.
 
 ## Files
 
@@ -180,8 +242,9 @@ Two Frontera facts drive the wrapper:
 | `link-probe.sh` | 30-second go/no-go gate. Run before any full build. |
 | `provenance.json` | The committed expectation the shim checks against. |
 | `herdr-attach.sh` | Attach to herdr on the job's compute node, with a node-local socket. |
-| `herdr-jobs-frontera.sh` | Interpreter wrapper for the SLURM sidebar. |
-| `config.frontera.toml` | Sidebar config pointing at the wrapper. |
+| `site.env` | Frontera values for `site/lib/herdr-site.sh` (python, login prefix, fork bin). |
+| `python3-frontera.sh` | Interpreter for the jobs provider; fixes libssp + Intel runtime. |
+| `frontera-limits.sh` | The limits that actually bite here; `herdr health` cannot see them. |
 | `build.slurm` | sbatch wrapper (`normal` queue, not `development`). |
 
 ## Updating and rebasing
