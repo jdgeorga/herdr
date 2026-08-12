@@ -210,6 +210,37 @@ Ordered. Each must pass before the next is meaningful.
    *content* change — the digest hashes contents, not mtimes, so `touch` does not trip it.
 7. **Sidebar populates** under a real `idev` session.
 
+## Results (2026-08-11)
+
+All gates 1–6 pass. `herdr 0.8.0` builds from source on a Frontera compute node and runs.
+
+| Gate | Result |
+|---|---|
+| 1. Actions live | 8 workflows indexed after the manual enable |
+| 2. CI produces the archive | green in 87 s; `undefined=72, defined=6328, external=36` |
+| 3. Archive readable by binutils 2.27 | `ar t` and `nm --print-armap` both fine, 11 members |
+| 4. C probe links and runs | passes with XALT tracking **both** on and off |
+| 5. Full build | `cargo build --release --locked` → `herdr 0.8.0`, linked against `librt.so.1` |
+| 6. Guard is fail-closed | modified vendor source → `rc=101` with a digest mismatch; restored → builds |
+
+Two assumptions were wrong and are now fixed:
+
+- **`-lrt` is required.** `libghostty-vt`'s kitty graphics code calls `shm_open`/`shm_unlink`,
+  which live in `librt` on glibc 2.17 and only moved into libc proper at glibc **2.34**.
+  Upstream's toolchains never need to ask, so `build.rs` emits no directive for it. Supplied
+  via `RUSTFLAGS` in `env.sh`, keeping the diff off upstream-owned files.
+- **The archive does not embed the vendored VERSION string.** `-Dversion-string` sets the
+  *app* version; the library reports `config.lib_version`, which comes from
+  `-Dlib-version-string` and defaults to `0.1.0-dev`. A `strings`-based staleness check would
+  have failed every legitimate build. Removed — the source-tree digest already covers it.
+
+The single largest risk in the design turned out not to exist: the archive's 36 external
+symbols are `fstat64`, `openat64`, `pread64` and similar — **no `statx`**. The syscall gap
+that makes the Zig *compiler* unusable here does not extend to the library it produces.
+
+Not yet exercised: gate 7, the sidebar under a live herdr session. The provider and wrapper
+are verified standalone (`--mode live`, `--mode history`, and `--selftest` all pass).
+
 ## Maintenance
 
 On every rebase onto upstream `master`:
