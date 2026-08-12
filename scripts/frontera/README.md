@@ -106,32 +106,50 @@ socket on `/home1` from a compute node: `login1` and `login2` both saw the file 
 Beyond the socket, `session.json`, both logs, and `.plugins.lock` would also be written by two
 servers at once.
 
-The fix is to move the whole data dir to node-local `/tmp`, keeping `config.toml` shared:
+The fix is to relocate **only the socket**:
 
 ```bash
-XDG_CONFIG_HOME=/tmp/herdr-$USER-xdg \
-HERDR_CONFIG_PATH=$HOME/.config/herdr/config.toml \
-  herdr
+HERDR_SOCKET_PATH=/tmp/herdr-$USER-default.sock herdr
 ```
 
-`herdr-attach.sh` does this for you, and a `herdr()` function in `~/.bashrc` does it for bare
+`herdr-attach.sh` does this, and a `herdr()` function in `~/.bashrc` does it for bare
 invocations — which matters, because `herdr-attach` only protects the paths that go through it,
-and a bare `herdr` typed on the compute node would otherwise still use the `/home1` socket.
+and a bare `herdr` would otherwise still use the `/home1` socket. The client socket is derived
+from the API socket, so one variable covers both.
 
-Three things worth knowing about that arrangement:
+**Never relocate the data dir with `XDG_CONFIG_HOME`.** This was tried and it backfired badly.
+The variable is not herdr-specific, and **herdr exports its whole environment into every pane** —
+so a server started with `XDG_CONFIG_HOME` hands that value to every process in every pane.
+`gh`, `gcloud`, `yazi`, and `matplotlib` then look for their config inside herdr's state dir and
+find nothing. On 2026-08-12 this made `gh auth status` report "not logged into any GitHub hosts"
+in a live session, with `~/.config/gh/hosts.yml` perfectly intact. The socket variable is
+targeted and safe; `XDG_CONFIG_HOME` is not.
 
-- **Do not `export XDG_CONFIG_HOME` globally.** It is not herdr-specific: `gh`, `gcloud`,
-  `tmux`, `yazi`, and `matplotlib` all keep config under `~/.config`, and a global export
-  breaks `gh` auth. Scope it per-invocation — that is why `.bashrc` defines a function rather
-  than setting a variable.
+`~/.bashrc` also carries a repair for this: if an inherited `XDG_CONFIG_HOME` points at a herdr
+state dir, it unsets it. That fixes existing panes without restarting a server and killing live
+work.
+
+Two more things worth knowing:
+
 - **Do not pass `--session`.** `active_api_socket_path()` checks `explicit_session_requested()`
-  **before** consulting the environment, so naming a session bypasses the relocation entirely.
-  Distinct `XDG_CONFIG_HOME` dirs give the same "named instance" effect.
-- **Layout no longer persists across jobs.** `session.json` holds workspaces and pane numbering;
-  on `/tmp` it dies with the node. That is the accepted cost of isolation.
+  **before** consulting the environment, so naming a session discards `HERDR_SOCKET_PATH` and
+  puts the socket back on Lustre.
+- **Prefer one server with several workspaces** over several servers. herdr already has
+  workspaces and tabs. Multiple servers share one `~/.config/herdr/session.json`, so the last
+  one to save wins the layout — an annoyance, not corruption, but avoidable.
 
-Run herdr on one host at a time regardless. Isolation prevents corruption; it does not merge
-two servers into one.
+### State across job endings
+
+Live processes cannot survive the allocation ending; SLURM kills them. **Layout can.**
+
+`~/.config/herdr` is on `/home1`, so it is already durable — no relocation needed. `session.json`
+records each pane's `cwd` and its `agent_session` id, and herdr restores from it at startup with
+`[session] resume_agents_on_restore` (default `true`), which resumes Claude sessions by id.
+
+Verified 2026-08-12: killed the server, deleted both sockets, restarted — herdr logged
+`persist.restore outcome="ok"` and came back with the pane's `cwd` intact. So after your job
+ends, starting herdr on the next node brings back the workspace/tab/pane layout and puts each
+shell back in its directory.
 
 ## The SLURM sidebar
 

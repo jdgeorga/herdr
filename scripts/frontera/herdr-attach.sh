@@ -24,9 +24,23 @@
 #      connecting to a Lustre-hosted socket from login1 and login2.
 #   2. session.json, both logs, and .plugins.lock would be written by both servers.
 #
-# XDG_CONFIG_HOME moves the whole data dir to node-local /tmp; HERDR_CONFIG_PATH keeps
-# config.toml shared and read-only on /home1. Verified: nothing new is written under
-# ~/.config/herdr, and the sidebar still reads its config.
+# ONLY the socket is relocated. Everything else stays at herdr's default ~/.config/herdr,
+# which lives on /home1 and is therefore already durable: session.json records each pane's
+# cwd and agent_session id, and herdr restores from it at startup ([session]
+# resume_agents_on_restore, default true). Verified 2026-08-12: killed the server, deleted
+# the sockets, restarted -> persist.restore outcome="ok" with the pane cwd intact. So a
+# layout, and resumable Claude sessions, survive the job ending and return on a new node.
+#
+# DO NOT relocate the data dir with XDG_CONFIG_HOME. That variable is not herdr-specific,
+# and herdr exports its whole environment into every pane -- so an XDG_CONFIG_HOME set for
+# the server silently redirects gh, gcloud, yazi and matplotlib inside every pane. It broke
+# `gh auth status` in a live session on 2026-08-12. The socket variable is targeted and
+# safe; XDG_CONFIG_HOME is not.
+#
+# Residual, accepted: two servers on different nodes share one ~/.config/herdr/session.json,
+# so the last to save wins the layout. That is an annoyance, not corruption -- the
+# destructive shared-socket case is what the node-local socket fixes. herdr has workspaces
+# and tabs, so prefer ONE server with several workspaces over several servers.
 #
 # We deliberately do NOT pass --session. In src/session.rs, active_api_socket_path()
 # checks explicit_session_requested() FIRST and returns a config-dir path, so naming a
@@ -110,21 +124,19 @@ printf 'job %s (%s): %s, %s left' "$jobid" "$jname" "$node" "$left"
 [ "$nnodes" -gt 1 ] && printf ' [+%d more: %s]' "$((nnodes - 1))" "$nodelist"
 printf '\n'
 
-XDG="/tmp/herdr-$USER-$NAME-xdg"
+SOCK="/tmp/herdr-$USER-$NAME.sock"
 
 # Absolute path rather than `ssh -t node bash -lc`: sourcing .bashrc on a compute node
 # fires start-tailscaled.sh, whose owner lockfile then refuses and prints noise on every
 # reconnect. The heredoc is QUOTED so $HOME/$USER are expanded by the REMOTE shell.
 remote="$(cat <<'EOF'
-export XDG_CONFIG_HOME="__XDG__"
-export HERDR_CONFIG_PATH="$HOME/.config/herdr/config.toml"
-mkdir -p "$XDG_CONFIG_HOME"
+export HERDR_SOCKET_PATH="__SOCK__"
 if [ ! -x "__BIN__" ]; then
     echo "herdr-attach: no herdr at __BIN__ on $(hostname -s)" >&2
     echo "  build it first:  cd ~/herdr && source scripts/frontera/env.sh && cargo build --release" >&2
     exit 127
 fi
-if [ ! -S "$XDG_CONFIG_HOME/herdr/herdr.sock" ]; then
+if [ ! -S "$HERDR_SOCKET_PATH" ]; then
     echo "herdr-attach: starting a new server cold over ssh -- its panes will have NO" >&2
     echo "  SLURM_* env, so ibrun/srun/mpirun will not work in them. For job-aware panes," >&2
     echo "  run herdr from inside the job shell instead." >&2
@@ -133,14 +145,14 @@ fi
 exec "__BIN__"
 EOF
 )"
-remote="${remote//__XDG__/$XDG}"
+remote="${remote//__SOCK__/$SOCK}"
 remote="${remote//__BIN__/$HERDR_BIN}"
 
 if [ "$DRY" -eq 1 ]; then
-    echo "state:  $XDG/herdr  (node-local /tmp, NOT /home1)"
-    echo "config: $HOME/.config/herdr/config.toml  (shared, read-only)"
+    echo "socket: $SOCK  (node-local /tmp, NOT a shared filesystem)"
+    echo "state:  $HOME/.config/herdr  (default; durable, survives the job)"
     if [ "$(hostname -s)" = "$node" ]; then
-        echo "would run locally: XDG_CONFIG_HOME=$XDG $HERDR_BIN"
+        echo "would run locally: HERDR_SOCKET_PATH=$SOCK $HERDR_BIN"
     else
         echo "would run: ssh -t $node <<'---'"
         printf '%s\n' "$remote" | sed 's/^/  /'
@@ -155,9 +167,7 @@ if [ -n "${TMUX:-}" ]; then
 fi
 
 if [ "$(hostname -s)" = "$node" ]; then
-    export XDG_CONFIG_HOME="$XDG"
-    export HERDR_CONFIG_PATH="$HOME/.config/herdr/config.toml"
-    mkdir -p "$XDG_CONFIG_HOME"
+    export HERDR_SOCKET_PATH="$SOCK"
     exec "$HERDR_BIN"
 fi
 
