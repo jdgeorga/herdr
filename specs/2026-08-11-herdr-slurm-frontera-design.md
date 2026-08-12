@@ -238,8 +238,21 @@ The single largest risk in the design turned out not to exist: the archive's 36 
 symbols are `fstat64`, `openat64`, `pread64` and similar — **no `statx`**. The syscall gap
 that makes the Zig *compiler* unusable here does not extend to the library it produces.
 
-Not yet exercised: gate 7, the sidebar under a live herdr session. The provider and wrapper
-are verified standalone (`--mode live`, `--mode history`, and `--selftest` all pass).
+**Gate 7 also passes.** `herdr config check` accepts the sidebar schema, and a real session
+in a sized pty invoked the provider on its refresh loop —
+`/opt/apps/intel19/python3/3.9.2/bin/python3 -I -S .../herdr-jobs.py --mode live`, via the
+wrapper, with the `-I -S` the provider's contract requires — and rendered the live row:
+
+```
+JOBS            [ live | history ]
+Running
+jdgeorga   1N   3:02:24
+```
+
+matching the provider's own output for job 7896009. Two things were needed to see it: the pty
+must have a size (`script` without `stty rows/cols` gives herdr nothing to draw into, and it
+emits only mode-setting escapes), and the list must not be collapsed — so the shipped config
+now sets `collapsed = false`.
 
 ## Maintenance
 
