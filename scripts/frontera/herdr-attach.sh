@@ -12,18 +12,25 @@
 # where your session isn't. The compute node is reachable from every login node for
 # the life of the job, which makes the login node pure transit.
 #
-# THE SOCKET MUST BE NODE-LOCAL. herdr defaults to ~/.config/herdr/herdr.sock, and
-# /home1 is Lustre -- shared across every login and compute node. A socket file
-# visible from a host where the server process does not exist is the exact failure
-# mode that bites tailscaled here: a liveness probe on a sibling node sees the file,
-# concludes nothing is running, and starts a second server against the same state.
-# So we point HERDR_SOCKET_PATH at /tmp, which is node-local.
+# ALL MUTABLE STATE MUST BE NODE-LOCAL. herdr's data dir defaults to ~/.config/herdr,
+# and /home1 is Lustre -- shared across every login and compute node. Two consequences,
+# the first of which is destructive:
+#
+#   1. The socket file is visible from hosts where the server process does not exist.
+#      Connecting to it from such a host returns ECONNREFUSED, and herdr's
+#      prepare_socket_path() treats ECONNREFUSED as "stale" and DELETES the file. So a
+#      herdr started on a login node removes the live compute-node server's socket and
+#      starts a second one, orphaning the first server's panes. Verified 2026-08-11 by
+#      connecting to a Lustre-hosted socket from login1 and login2.
+#   2. session.json, both logs, and .plugins.lock would be written by both servers.
+#
+# XDG_CONFIG_HOME moves the whole data dir to node-local /tmp; HERDR_CONFIG_PATH keeps
+# config.toml shared and read-only on /home1. Verified: nothing new is written under
+# ~/.config/herdr, and the sidebar still reads its config.
 #
 # We deliberately do NOT pass --session. In src/session.rs, active_api_socket_path()
-# checks explicit_session_requested() FIRST and returns a config-dir path, ignoring
-# HERDR_SOCKET_PATH entirely -- which would silently put the socket back on Lustre.
-# Distinct socket paths give the same "named session" effect. The client socket is
-# derived from the API socket, so setting the one variable is enough.
+# checks explicit_session_requested() FIRST and returns a config-dir path, so naming a
+# session would bypass the relocation. Distinct XDG dirs give the same effect.
 #
 # Caveat inherited from idev-attach: a server born from THIS ssh gets a bare login
 # environment (measured: 0 SLURM_* vars, versus 41 in a server started from inside
@@ -43,7 +50,7 @@ usage: herdr-attach [-n] [-j JOBID] [NAME]
 
   -n, --dry-run   print the resolved node and command, do not connect
   -j, --job ID    use this job instead of auto-picking
-  NAME            herdr instance name (default: agents); selects the socket path
+  NAME            herdr instance name (default: agents); selects the state dir
 
 Auto-pick order: the only RUNNING job; else the one named idv*; else it lists the
 candidates and exits so you can pass -j. (Same selection as idev-attach/job-node.)
@@ -60,7 +67,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Interpolated into a remote shell command and into a socket path. Keep it boring.
+# Interpolated into a remote shell command and into a filesystem path. Keep it boring.
 case "$NAME" in
     ""|*[!A-Za-z0-9._-]*)
         echo "name must match [A-Za-z0-9._-]+ (got '$NAME')" >&2
@@ -103,19 +110,21 @@ printf 'job %s (%s): %s, %s left' "$jobid" "$jname" "$node" "$left"
 [ "$nnodes" -gt 1 ] && printf ' [+%d more: %s]' "$((nnodes - 1))" "$nodelist"
 printf '\n'
 
-SOCK="/tmp/herdr-$USER-$NAME.sock"
+XDG="/tmp/herdr-$USER-$NAME-xdg"
 
 # Absolute path rather than `ssh -t node bash -lc`: sourcing .bashrc on a compute node
 # fires start-tailscaled.sh, whose owner lockfile then refuses and prints noise on every
 # reconnect. The heredoc is QUOTED so $HOME/$USER are expanded by the REMOTE shell.
 remote="$(cat <<'EOF'
-export HERDR_SOCKET_PATH="__SOCK__"
+export XDG_CONFIG_HOME="__XDG__"
+export HERDR_CONFIG_PATH="$HOME/.config/herdr/config.toml"
+mkdir -p "$XDG_CONFIG_HOME"
 if [ ! -x "__BIN__" ]; then
     echo "herdr-attach: no herdr at __BIN__ on $(hostname -s)" >&2
     echo "  build it first:  cd ~/herdr && source scripts/frontera/env.sh && cargo build --release" >&2
     exit 127
 fi
-if [ ! -S "$HERDR_SOCKET_PATH" ]; then
+if [ ! -S "$XDG_CONFIG_HOME/herdr/herdr.sock" ]; then
     echo "herdr-attach: starting a new server cold over ssh -- its panes will have NO" >&2
     echo "  SLURM_* env, so ibrun/srun/mpirun will not work in them. For job-aware panes," >&2
     echo "  run herdr from inside the job shell instead." >&2
@@ -124,13 +133,14 @@ fi
 exec "__BIN__"
 EOF
 )"
-remote="${remote//__SOCK__/$SOCK}"
+remote="${remote//__XDG__/$XDG}"
 remote="${remote//__BIN__/$HERDR_BIN}"
 
 if [ "$DRY" -eq 1 ]; then
-    echo "socket: $SOCK  (node-local /tmp, NOT /home1)"
+    echo "state:  $XDG/herdr  (node-local /tmp, NOT /home1)"
+    echo "config: $HOME/.config/herdr/config.toml  (shared, read-only)"
     if [ "$(hostname -s)" = "$node" ]; then
-        echo "would run locally: HERDR_SOCKET_PATH=$SOCK $HERDR_BIN"
+        echo "would run locally: XDG_CONFIG_HOME=$XDG $HERDR_BIN"
     else
         echo "would run: ssh -t $node <<'---'"
         printf '%s\n' "$remote" | sed 's/^/  /'
@@ -145,7 +155,9 @@ if [ -n "${TMUX:-}" ]; then
 fi
 
 if [ "$(hostname -s)" = "$node" ]; then
-    export HERDR_SOCKET_PATH="$SOCK"
+    export XDG_CONFIG_HOME="$XDG"
+    export HERDR_CONFIG_PATH="$HOME/.config/herdr/config.toml"
+    mkdir -p "$XDG_CONFIG_HOME"
     exec "$HERDR_BIN"
 fi
 
