@@ -4,7 +4,7 @@
   "vendor_tree_sha256": "eee58204d3608f1eee629b2fdda6767624eb4ec8f5876993640abf7295d440b3",
   "vendor_tree_digest_cmd": "export LC_ALL=C; find vendor/libghostty-vt \\( -name zig-out -o -name .zig-cache -o -name zig-cache \\) -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum",
   "vendor_tree_digest_note": "LC_ALL must be EXPORTED, not used as a command prefix: 'LC_ALL=C find ... | sort' applies the locale only to find, leaving sort under the ambient locale and yielding a different digest. Verified: the two forms disagree on this tree.",
-  "archive_sha256": "5a983b9365329a9422d458218145f6d59d6b9a469a15a6e1384d5c77fbc23dc7",
+  "archive_sha256": "4c51015d22777512daee8b2c42f723d384dee47e40138209bfdce6fe72d7df9a",
   "version_string": "1.3.2-HEAD-+c5a21edfc",
   "source_commit": "c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3",
   "rust_target": "x86_64-unknown-linux-gnu",
@@ -21,5 +21,5 @@
     "-Demit-xcframework=false"
   ],
   "zig_argv_note": "Mirrors build.rs's own invocation, with two Frontera-specific additions. build.rs emits -Dtarget=x86_64-linux-gnu (UNVERSIONED); zig's default glibc for that triple is 2.28, newer than Frontera's 2.17, so the .2.17 suffix is load-bearing. -Dcpu=baseline is redundant given that an explicit -Dtarget already resolves cpu to Target.Cpu.baseline, but it makes the invariant self-documenting.",
-  "ci_run_url": "https://github.com/jdgeorga/herdr/actions/runs/31551220769"
+  "ci_run_url": "https://github.com/jdgeorga/herdr/actions/runs/31552042360"
 }
