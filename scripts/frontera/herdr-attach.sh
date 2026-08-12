@@ -114,10 +114,18 @@ EOF
 )"
 remote="${remote//__BIN__/$HERDR_BIN}"
 # Bake the passthrough args in, so stdin stays free for the tty.
-if [ "$#" -gt 0 ]; then
-    remote="set -- $(printf '%q ' "$@")
+#
+# ALWAYS emit `set --`, even with no args. bash sources ~/.bashrc for ssh commands, and a
+# .bashrc that runs `set` with operands leaves positional parameters behind for us to
+# inherit -- this one has `set umask 027` at line 107, which does not set the umask at all
+# (that would be plain `umask 027`); it sets $1=umask $2=027. Those then reached
+# `exec herdr "$@"` and herdr died with `unknown command: umask`. Clearing the positionals
+# unconditionally makes this immune to whatever any future rc file leaves lying around.
+#
+# The `[ "$#" -gt 0 ] &&` guard matters: `printf '%q ' ` with zero arguments prints `''`,
+# so an unconditional expansion would emit `set -- ''` and hand herdr one empty argument.
+remote="set -- $([ "$#" -gt 0 ] && printf '%q ' "$@")
 $remote"
-fi
 
 if [ "$DRY" -eq 1 ]; then
     echo "socket/session/config: owned by site/bin/herdr-slurm on $node"
