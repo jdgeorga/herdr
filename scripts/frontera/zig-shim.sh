@@ -126,12 +126,16 @@ ACTUAL_ARCHIVE=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
     "  actual   $ACTUAL_ARCHIVE" \
     "Re-run: scripts/frontera/fetch-artifact.sh"
 
-# --- 5. independent staleness check: the archive embeds -Dversion-string ------------
-if [ -n "$EXPECT_VERSION" ] && ! strings -a "$ARCHIVE" | grep -qF -- "$EXPECT_VERSION"; then
-    die "archive does not embed version string '$EXPECT_VERSION'." \
-        "It was built from different sources than provenance claims." \
-        "${REBUILD_HINT[@]}"
-fi
+# --- 5. (removed) -----------------------------------------------------------------
+# There was a `strings | grep <VERSION>` check here. It was wrong and would have failed
+# every legitimate build: -Dversion-string sets the *app* version (config.version), while
+# the library reports config.lib_version, which comes from -Dlib-version-string and
+# defaults to "0.1.0-dev". The vendored VERSION string is never embedded in the archive.
+# Verified against the real CI artifact on 2026-08-11.
+#
+# No replacement is needed. Staleness is covered by step 3 (the vendored-source digest)
+# and integrity by step 4 (the archive's own sha256); both are stronger than a substring
+# search, and neither depends on what the library chooses to record about itself.
 
 # --- 6. stage it where build.rs looks ------------------------------------------------
 # vendor/libghostty-vt/zig-out/ is gitignored (vendor/libghostty-vt/.gitignore:12).
