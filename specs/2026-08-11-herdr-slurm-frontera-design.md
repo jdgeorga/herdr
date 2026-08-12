@@ -100,12 +100,21 @@ deliberate, reviewable commit — never automatic.
 Current expected values:
 
 ```
-vendor_tree_sha256  3235075cd8eecc8845da6e8bb22afca5356e97a8cbbc4dbb6d94f9d030d92906
+vendor_tree_sha256  eee58204d3608f1eee629b2fdda6767624eb4ec8f5876993640abf7295d440b3
 version_string      1.3.2-HEAD-+c5a21edfc
 source_commit       c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3
 rust_target         x86_64-unknown-linux-gnu
 zig_target          x86_64-linux-gnu.2.17
 ```
+
+Two non-obvious requirements on that digest, both learned the hard way:
+
+- **`LC_ALL` must be exported, not prefixed.** `LC_ALL=C find … | sort` applies the locale only
+  to `find`, leaving `sort` under the ambient locale. The two forms produce different digests on
+  this tree, so CI and Frontera would disagree on every build.
+- **Generated directories must be pruned.** The shim stages the archive into
+  `vendor/libghostty-vt/zig-out/`, which would otherwise be inside the tree being hashed and
+  would change the digest on the very next build.
 
 ### 2. Gate plane — `scripts/frontera/zig-shim.sh`
 
@@ -168,6 +177,7 @@ All additions. No upstream-owned file is modified.
 scripts/frontera/zig-shim.sh
 scripts/frontera/env.sh
 scripts/frontera/fetch-artifact.sh
+scripts/frontera/link-probe.sh
 scripts/frontera/herdr-jobs-frontera.sh
 scripts/frontera/build.slurm
 scripts/frontera/config.frontera.toml
@@ -194,9 +204,10 @@ Ordered. Each must pass before the next is meaningful.
    build. **This is the go/no-go**, and it costs 30 seconds instead of a 600-crate build.
 5. **Full build.** `cargo build --release --locked` on a compute node, producing a runnable
    `herdr --version`.
-6. **The guard is real.** `touch vendor/libghostty-vt/src/*.zig && cargo build --release` must
-   **fail** with a provenance mismatch. If it succeeds, the guard is fail-open and the design's
-   worst risk is live. This is a required test, not a nicety.
+6. **The guard is real.** Appending a line to `vendor/libghostty-vt/src/lib_vt.zig` and
+   rebuilding must **fail** with a provenance mismatch. If it succeeds, the guard is fail-open
+   and the design's worst risk is live. This is a required test, not a nicety. It must be a
+   *content* change — the digest hashes contents, not mtimes, so `touch` does not trip it.
 7. **Sidebar populates** under a real `idev` session.
 
 ## Maintenance

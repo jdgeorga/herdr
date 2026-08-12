@@ -1,0 +1,150 @@
+name: frontera-libghostty-vt
+
+# Builds the one artifact TACC Frontera cannot build for itself: the vendored
+# libghostty-vt static archive, targeting glibc 2.17.
+#
+# Frontera is CentOS 7 on kernel 3.10. Zig 0.15.x calls statx(2) (Linux 4.11+) with no
+# fallback, so it cannot run there at all -- not in a container either, since Apptainer
+# shares the host kernel. See specs/2026-08-11-herdr-slurm-frontera-design.md.
+#
+# TRIGGER: push, not workflow_dispatch alone. GitHub only surfaces dispatchable workflows
+# that live on the default branch (master), and putting this there would diverge the fork's
+# master from upstream. A push trigger runs from the branch the workflow lives on.
+
+on:
+  push:
+    branches: [herdr-slurm-frontera]
+    paths:
+      - 'vendor/libghostty-vt/**'
+      - 'scripts/frontera/provenance.json'
+      - '.github/workflows/frontera-libghostty-vt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: frontera-libghostty-vt
+  ZIG_TARGET: x86_64-linux-gnu.2.17
+  RUST_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    # Never run this on the canonical repo, only on the fork it was written for.
+    if: github.repository == 'jdgeorga/herdr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Compute vendored-source digest
+        id: digest
+        run: |
+          set -euo pipefail
+          # MUST match scripts/frontera/zig-shim.sh byte for byte, including LC_ALL=C
+          # (locale changes sort order) and the prune (the shim stages the archive into
+          # zig-out/, which would otherwise land inside the hashed tree).
+          export LC_ALL=C
+          d=$(find vendor/libghostty-vt \
+                \( -name zig-out -o -name .zig-cache -o -name zig-cache \) -prune \
+                -o -type f -print0 \
+              | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+          echo "vendor_tree_sha256=$d" >> "$GITHUB_OUTPUT"
+          echo "version_string=$(cat vendor/libghostty-vt/VERSION)" >> "$GITHUB_OUTPUT"
+          echo "digest: $d"
+
+      - name: Build libghostty-vt.a
+        working-directory: vendor/libghostty-vt
+        run: |
+          set -euo pipefail
+          # Mirrors build.rs's invocation, plus the glibc pin and an explicit baseline CPU.
+          # build.rs emits an UNVERSIONED -Dtarget=x86_64-linux-gnu, and zig's default glibc
+          # for that is 2.28 -- newer than Frontera's 2.17. The suffix is load-bearing.
+          zig build \
+            -Demit-lib-vt \
+            -Doptimize=ReleaseFast \
+            -Dsimd=true \
+            -Dtarget=${{ env.ZIG_TARGET }} \
+            -Dcpu=baseline \
+            -Dversion-string="$(cat VERSION)" \
+            -Demit-xcframework=false
+          ls -la zig-out/lib/
+
+      - name: Gate -- no C++ runtime symbols left undefined
+        working-directory: vendor/libghostty-vt
+        run: |
+          set -euo pipefail
+          nm --undefined-only --format=posix zig-out/lib/libghostty-vt.a \
+            | awk '{print $1}' | sort -u > /tmp/undef.txt
+          if grep -E '^(_Z|__cxa_|__gxx_personality|_Unwind_|_Znwm|_ZdlPv)' /tmp/undef.txt; then
+            echo "::error::archive needs a C++ runtime; it will not link on Frontera"
+            exit 1
+          fi
+          echo "no C++ runtime symbols -- ok"
+          cp /tmp/undef.txt libghostty-vt.undefined-symbols.txt
+
+      - name: Write provenance
+        working-directory: vendor/libghostty-vt
+        run: |
+          set -euo pipefail
+          archive_sha=$(sha256sum zig-out/lib/libghostty-vt.a | cut -d' ' -f1)
+          version='${{ steps.digest.outputs.version_string }}'
+          python3 - "$archive_sha" "$version" <<'PY'
+          import json, os, sys
+          archive_sha, version = sys.argv[1], sys.argv[2]
+          src = json.load(open("../../scripts/frontera/provenance.json"))
+          out = {
+              "_comment": src["_comment"],
+              "status": "built",
+              "vendor_tree_sha256": os.environ["VENDOR_TREE_SHA256"],
+              "vendor_tree_digest_cmd": src["vendor_tree_digest_cmd"],
+              "archive_sha256": archive_sha,
+              "version_string": version,
+              "source_commit": json.load(open("../libghostty-vt.vendor.json"))["source_commit"],
+              "rust_target": os.environ["RUST_TARGET"],
+              "zig_target": os.environ["ZIG_TARGET"],
+              "zig_version": "0.15.2",
+              "zig_argv": [
+                  "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dsimd=true",
+                  f"-Dtarget={os.environ['ZIG_TARGET']}", "-Dcpu=baseline",
+                  f"-Dversion-string={version}", "-Demit-xcframework=false",
+              ],
+              "zig_argv_note": src["zig_argv_note"],
+              "ci_run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          json.dump(out, open("provenance.json", "w"), indent=2)
+          print(json.dumps(out, indent=2))
+          PY
+        env:
+          VENDOR_TREE_SHA256: ${{ steps.digest.outputs.vendor_tree_sha256 }}
+
+      - name: Publish as a release asset
+        working-directory: vendor/libghostty-vt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A release asset, not an actions artifact: this repo's upload steps set
+          # retention-days: 7, and Frontera needs to re-fetch this long after that.
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --title "libghostty-vt.a for Frontera (glibc 2.17)" \
+              --notes "Prebuilt static archive for building herdr on TACC Frontera, where zig cannot run. Consumed by scripts/frontera/fetch-artifact.sh. Regenerated automatically; see the attached provenance.json for the exact source tree and flags." \
+              --prerelease
+          gh release upload "$RELEASE_TAG" \
+            zig-out/lib/libghostty-vt.a \
+            provenance.json \
+            libghostty-vt.undefined-symbols.txt \
+            --clobber
+
+      - name: Next steps
+        run: |
+          echo "Archive published to release '$RELEASE_TAG'."
+          echo "On Frontera:"
+          echo "  cp <the provenance.json from this run> scripts/frontera/provenance.json"
+          echo "  git commit -m 'chore(frontera): refresh libghostty-vt provenance'"
+          echo "  scripts/frontera/fetch-artifact.sh"
