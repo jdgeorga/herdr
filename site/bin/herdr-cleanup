@@ -1,0 +1,160 @@
+#!/bin/bash
+# Stop stock herdr and herdr-slurm across all previously used login nodes.
+# Saved session/layout JSON is preserved.
+
+set -uo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+stock_wrapper="$(herdr_site_wrapper stock)"
+stock_bin="$HERDR_SITE_STOCK_BIN"
+slurm_wrapper="$(herdr_site_wrapper slurm)"
+slurm_bin="$HERDR_SITE_FORK_BIN"
+spinner="$HOME/.config/herdr/scripts/herdr-spinner"
+
+usage() {
+  cat <<EOF
+Usage: herdr cleanup [--dry-run] [host ...]
+       herdr-slurm cleanup [--dry-run] [host ...]
+
+With no host arguments, discovers nodes from saved herdr-*/slurm-* sessions and
+per-node spinner records. Stops both herdr variants, removes only node-local
+runtime sockets, and preserves every saved session/layout file.
+
+This cluster's login nodes are matched by: ${HERDR_SITE_LOGIN_PATTERN}
+EOF
+}
+
+matching_server_pids() {
+  local pid exe my_uid
+  my_uid="$(id -u)"
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    case "$exe" in
+      "$stock_bin"|"$stock_bin (deleted)"|"$slurm_bin"|"$slurm_bin (deleted)") ;;
+      *) continue ;;
+    esac
+    if tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -Fxq server; then
+      printf '%s\n' "$pid"
+    fi
+  done < <({ pgrep -u "$my_uid" -x herdr-bin || true; pgrep -u "$my_uid" -x herdr || true; } | sort -nu)
+}
+
+cleanup_local() {
+  local host stock_rt slurm_rt
+  local -a pids=()
+  host="$(hostname -s)"
+  stock_rt="${TMPDIR:-/tmp}/herdr-${USER}-$host"
+  slurm_rt="${TMPDIR:-/tmp}/herdr-slurm-${USER}-$host"
+
+  if [[ -x "$spinner" ]]; then
+    HERDR_SOCKET_PATH="$slurm_rt/herdr.sock" \
+      HERDR_CLIENT_SOCKET_PATH="$slurm_rt/herdr-client.sock" \
+      timeout 3s "$spinner" stop >/dev/null 2>&1 || true
+  fi
+
+  if [[ -S "$stock_rt/herdr.sock" ]]; then
+    HERDR_SESSION="herdr-$host" \
+      HERDR_SOCKET_PATH="$stock_rt/herdr.sock" \
+      HERDR_CLIENT_SOCKET_PATH="$stock_rt/herdr-client.sock" \
+      timeout 3s "$stock_wrapper" server stop >/dev/null 2>&1 || true
+  fi
+
+  if [[ -S "$slurm_rt/herdr.sock" ]]; then
+    HERDR_SESSION="slurm-$host" \
+      HERDR_SOCKET_PATH="$slurm_rt/herdr.sock" \
+      HERDR_CLIENT_SOCKET_PATH="$slurm_rt/herdr-client.sock" \
+      timeout 3s "$slurm_wrapper" server stop >/dev/null 2>&1 || true
+  fi
+
+  # Transitional cleanup for a stock server started before the per-node
+  # wrapper existed and therefore still listening on the shared home socket.
+  if [[ -S "${XDG_RUNTIME_DIR:-/tmp}/herdr.sock" && -x "$stock_bin" ]]; then
+    env -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+      timeout 3s "$stock_bin" server stop >/dev/null 2>&1 || true
+  fi
+
+  timeout 3s systemctl --user stop "herdr-$host.service" "herdr-spinner-$host.service" \
+    "herdr-slurm-$host.service" >/dev/null 2>&1 || true
+
+  mapfile -t pids < <(matching_server_pids)
+  if (( ${#pids[@]} > 0 )); then
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    for _ in {1..30}; do
+      sleep 0.1
+      mapfile -t pids < <(matching_server_pids)
+      (( ${#pids[@]} == 0 )) && break
+    done
+  fi
+
+  mapfile -t pids < <(matching_server_pids)
+  if (( ${#pids[@]} > 0 )); then
+    kill -KILL "${pids[@]}" 2>/dev/null || true
+  fi
+
+  rm -f "$stock_rt/herdr.sock" "$stock_rt/herdr-client.sock" \
+    "$slurm_rt/herdr.sock" "$slurm_rt/herdr-client.sock"
+  echo "$host: stopped stock and slurm"
+}
+
+dry_run=0
+local_only=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --dry-run) dry_run=1 ;;
+    --local) local_only=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if herdr_site_is_login_host "$1"; then
+        herdr_site_add_host "$1"
+      else
+        echo "herdr cleanup: not a login node of this cluster: $1" >&2
+        echo "  expected a host matching ${HERDR_SITE_LOGIN_PATTERN}" >&2
+        usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+  shift
+done
+
+if (( local_only )); then
+  cleanup_local
+  exit 0
+fi
+
+if [[ "${HERDR_ENV:-0}" == "1" ]]; then
+  echo "herdr cleanup: run this from a normal login shell, not inside a herdr pane" >&2
+  echo "stopping the current server would terminate the cleanup coordinator" >&2
+  exit 2
+fi
+
+herdr_site_hosts
+if (( dry_run )); then
+  printf 'Would stop stock herdr and herdr-slurm on: %s\n' "${HERDR_SITE_HOSTS[*]}"
+  exit 0
+fi
+
+result_dir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-cleanup.XXXXXXXX")"
+trap 'rm -rf "$result_dir"' EXIT
+
+printf 'Stopping stock herdr and herdr-slurm on: %s\n' "${HERDR_SITE_HOSTS[*]}"
+# Clean nodes concurrently. One stale node can no longer hold up every other
+# live node, and the outer timeout bounds remote cleanup if SSH hangs.
+herdr_site_fanout 20s "$result_dir" cleanup
+
+for host in "${HERDR_SITE_HOSTS[@]}"; do
+  cat "$result_dir/$host.out" 2>/dev/null || true
+done
+
+if (( ${#HERDR_SITE_UNAVAILABLE[@]} > 0 )); then
+  for host in "${HERDR_SITE_UNAVAILABLE[@]}"; do
+    echo "$host: cleanup failed or host unavailable" >&2
+  done
+  echo "herdr cleanup: ${#HERDR_SITE_UNAVAILABLE[@]} node(s) could not be cleaned" >&2
+  exit 1
+fi

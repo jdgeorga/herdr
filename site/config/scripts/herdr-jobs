@@ -1,0 +1,35 @@
+#!/bin/bash
+# Interpreter shim for the SLURM jobs sidebar provider.
+#
+# This exists so config.toml can stay free of cluster-specific paths. The
+# sidebar's `command` points here; the interpreter is resolved at run time by
+# site/lib/herdr-site.sh instead of being pinned in config.
+#
+# -I -S are mandatory and are the reason a bare shebang is not enough: python
+# startup can run a sitecustomize that prints to stdout, which corrupts the JSON
+# payload herdr parses. herdr spawns this command with Command::new(program),
+# so the shebang above is honoured and the flags below are applied here.
+
+set -euo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+_repo="$(cd -- "$(dirname -- "$_self")/../../.." && pwd -P)"
+
+# shellcheck source=../../lib/herdr-site.sh
+. "$_repo/site/lib/herdr-site.sh"
+
+provider="$_repo/scripts/herdr-jobs.py"
+
+if [[ ! -f "$provider" ]]; then
+  echo "herdr-jobs: provider not found at $provider" >&2
+  exit 1
+fi
+
+if [[ -z "${HERDR_SITE_PYTHON:-}" ]]; then
+  echo 'herdr-jobs: no python >= 3.11 found' >&2
+  echo '  set HERDR_SITE_PYTHON in ~/.config/herdr-slurm/site.env' >&2
+  echo '  see: herdr site' >&2
+  exit 1
+fi
+
+exec "$HERDR_SITE_PYTHON" -I -S "$provider" "$@"

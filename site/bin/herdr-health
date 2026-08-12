@@ -1,0 +1,154 @@
+#!/bin/bash
+# Read-only health inventory across remembered login nodes.
+
+set -uo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+usage() {
+  cat <<EOF
+Usage: herdr health [host ...]
+       herdr-slurm health [host ...]
+
+Read-only, concurrent health check. With no host arguments, discovers nodes
+from saved herdr sessions and spinner records. Reports the user's cgroup memory
+and task usage, cumulative OOM kills, running herdr variants, repeated process
+groups, and user-owned Claude /tmp directories of at least 1 GiB.
+
+Exit status is nonzero only when one or more requested nodes are unavailable.
+
+This cluster's login nodes are matched by: ${HERDR_SITE_LOGIN_PATTERN}
+Cgroup metrics are read from: ${HERDR_SITE_CGROUP_DIR} (${HERDR_SITE_CGROUP_MODE})
+EOF
+}
+
+probe_variant() {
+  local variant="$1" command="$2" output
+  output="$(timeout 3s "$command" status server 2>/dev/null || true)"
+  grep -Fqx 'status: running' <<<"$output" && printf '%s ' "$variant"
+}
+
+probe_local() {
+  local host uid mem max tasks tasks_max oom variants path bytes tmpdir
+  local stock_pid slurm_pid
+  host="$(hostname -s)"
+  uid="$(id -u)"
+  mem="$(herdr_site_cgroup_read memory)"
+  max="$(herdr_site_cgroup_read memory_max)"
+  tasks="$(herdr_site_cgroup_read tasks)"
+  tasks_max="$(herdr_site_cgroup_read tasks_max)"
+  oom="$(herdr_site_cgroup_oom_kills)"
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-health-local.XXXXXXXX")"
+  probe_variant stock "$(herdr_site_wrapper stock)" >"$tmpdir/stock" &
+  stock_pid=$!
+  probe_variant slurm "$(herdr_site_wrapper slurm)" >"$tmpdir/slurm" &
+  slurm_pid=$!
+  wait "$stock_pid" || true
+  wait "$slurm_pid" || true
+  variants="$(cat "$tmpdir/stock" "$tmpdir/slurm")"
+  rm -rf "$tmpdir"
+  variants="${variants% }"
+  [[ -n "$variants" ]] || variants="-"
+  printf 'SUMMARY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$host" "$mem" "$max" "$tasks" "$tasks_max" "$oom" "$variants"
+
+  # Report suspicious repetition more broadly than reap acts on. Reap applies
+  # its own stricter threshold and validation immediately before signalling.
+  # Reading full command lines from /proc can block behind a wedged process on
+  # a busy login node. comm is enough to identify repetition and stays responsive.
+  ps -u "$uid" -o pgid=,rss=,etimes=,comm= 2>/dev/null | awk -v node="$host" '
+    {
+      pgid=$1; rss=$2; age=$3; comm=$4
+      count[pgid]++; mem[pgid]+=rss
+      if (age > oldest[pgid]) oldest[pgid]=age
+      if (!(pgid in cmd)) cmd[pgid]=comm
+    }
+    END {
+      for (p in count)
+        if (count[p] >= 25)
+          printf "GROUP\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", node, p,
+                 count[p], mem[p], oldest[p], cmd[p], "-"
+    }'
+
+  while IFS= read -r -d '' path; do
+    [[ -O "$path" ]] || continue
+    bytes="$(timeout 5s du -sx --block-size=1 "$path" 2>/dev/null | awk '{print $1}')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || continue
+    (( bytes >= 1073741824 )) || continue
+    printf 'TMP\t%s\t%s\t%s\n' "$host" "$bytes" "$path"
+  done < <(find /tmp -maxdepth 1 -mindepth 1 -type d -user "$uid" \
+           -name 'claude-[0-9]*' -print0 2>/dev/null)
+}
+
+local_only=0
+while (( $# > 0 )); do
+  case "$1" in
+    --local) local_only=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if herdr_site_is_login_host "$1"; then
+        herdr_site_add_host "$1"
+      else
+        echo "herdr health: not a login node of this cluster: $1" >&2
+        echo "  expected a host matching ${HERDR_SITE_LOGIN_PATTERN}" >&2
+        usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+  shift
+done
+
+if (( local_only )); then
+  probe_local
+  exit 0
+fi
+
+herdr_site_hosts
+result_dir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-health.XXXXXXXX")"
+trap 'rm -rf "$result_dir"' EXIT
+
+herdr_site_fanout 20s "$result_dir" health
+
+printf '%-9s %13s %8s %9s %8s %8s %s\n' NODE MEMORY LIMIT TASKS TASKLIMIT OOMKILLS HERDR
+for host in "${HERDR_SITE_HOSTS[@]}"; do
+  [[ -r "$result_dir/$host.out" ]] || continue
+  while IFS=$'\t' read -r kind node mem max tasks tasks_max oom variants; do
+    [[ "$kind" == SUMMARY ]] || continue
+    if [[ "$max" =~ ^[0-9]+$ ]] && (( max > 0 )); then
+      pct="$(awk -v a="$mem" -v b="$max" 'BEGIN {printf "%.0f%%", 100*a/b}')"
+      used="$(herdr_site_human_bytes "$mem")/$pct"
+    else
+      used="$(herdr_site_human_bytes "$mem")"
+    fi
+    printf '%-9s %13s %8s %9s %8s %8s %s\n' "$node" "$used" \
+      "$(herdr_site_human_bytes "$max")" "$tasks" "$tasks_max" "$oom" "$variants"
+  done <"$result_dir/$host.out"
+done
+
+groups="$(awk -F '\t' '$1 == "GROUP"' "$result_dir"/*.out 2>/dev/null || true)"
+if [[ -n "$groups" ]]; then
+  echo
+  echo 'Repeated process groups (informational; count >= 25):'
+  printf '%-9s %8s %7s %9s %9s %-16s %s\n' NODE PGID COUNT RSS AGE COMMAND SAMPLE
+  while IFS=$'\t' read -r _ node pgid count rss age command sample; do
+    printf '%-9s %8s %7s %9s %8ss %-16s %s\n' "$node" "$pgid" "$count" \
+      "$(herdr_site_human_bytes "$((rss * 1024))")" "$age" "$command" "$sample"
+  done <<<"$groups"
+fi
+
+temps="$(awk -F '\t' '$1 == "TMP"' "$result_dir"/*.out 2>/dev/null || true)"
+if [[ -n "$temps" ]]; then
+  echo
+  echo 'Large user-owned Claude /tmp directories (>= 1 GiB):'
+  while IFS=$'\t' read -r _ node bytes path; do
+    printf '  %s  %8s  %s\n' "$node" "$(herdr_site_human_bytes "$bytes")" "$path"
+  done <<<"$temps"
+fi
+
+if (( ${#HERDR_SITE_UNAVAILABLE[@]} > 0 )); then
+  printf 'Unavailable nodes: %s\n' "${HERDR_SITE_UNAVAILABLE[*]}" >&2
+  exit 1
+fi

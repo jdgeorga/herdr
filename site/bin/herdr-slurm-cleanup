@@ -1,0 +1,4 @@
+#!/bin/bash
+# Compatibility entry point; the shared cleanup handles both herdr variants.
+set -euo pipefail
+exec "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/herdr-cleanup" "$@"

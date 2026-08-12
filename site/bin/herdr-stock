@@ -1,0 +1,77 @@
+#!/bin/bash
+# Run *stock* (unforked) herdr in a login-node-specific session. Home is shared
+# across login nodes on many clusters, but Unix sockets and server processes are
+# not.
+#
+# Plain `herdr` is the SLURM fork (symlink to herdr-slurm). This is the escape
+# hatch back to upstream: the released binary (default ~/.local/bin/herdr-bin),
+# the stock config, and its own session/socket namespace. `herdr-stock update`
+# self-updates this install only and leaves the fork alone.
+
+set -euo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+this_host="$(hostname -s)"
+REAL_BIN="$HERDR_SITE_STOCK_BIN"
+
+case "${1:-}" in
+  cleanup|ls|health|reap)
+    command="$1"
+    shift
+    exec "$(herdr_site_wrapper "$command")" "$@"
+    ;;
+  site)
+    shift
+    herdr_site_report
+    exit 0
+    ;;
+  --help|-h)
+    cat <<EOF
+This is stock (unforked) herdr. Plain \`herdr\` runs the SLURM fork.
+
+Login-node management commands:
+  herdr-stock ls [host ...]          List live herdr sessions across login nodes
+  herdr-stock cleanup [--dry-run]    Stop herdr on remembered login nodes
+  herdr-stock health [host ...]      Report memory, OOM, processes, large /tmp use
+  herdr-stock reap [options]         Find runaways (dry-run unless explicitly enabled)
+  herdr-stock site                   Show resolved cluster paths and where each came from
+
+Run \`herdr-stock <command> --help\` for details. These commands also work through
+\`herdr\` and \`herdr-slurm\`, and operate on both herdr variants.
+Docs: $HERDR_SITE_REPO/site/README.md
+
+Upstream herdr help:
+EOF
+    exec "$REAL_BIN" --help
+    ;;
+esac
+
+if [[ ! -x "$REAL_BIN" ]]; then
+  echo "herdr-stock: stock binary not found at $REAL_BIN" >&2
+  echo "  install upstream herdr, or set HERDR_SITE_STOCK_BIN to its path" >&2
+  exit 1
+fi
+
+export HERDR_SESSION="${HERDR_SESSION:-herdr-$this_host}"
+
+# Seed only a brand-new node's default session. Existing node sessions are
+# never overwritten. Set HERDR_TEMPLATE=/dev/null to start empty.
+if [[ $# -eq 0 || ( $# -eq 1 && "$1" == "server" ) ]]; then
+  template="${HERDR_TEMPLATE:-$HOME/.config/herdr/session-template.json}"
+  session_file="$HOME/.config/herdr/sessions/$HERDR_SESSION/session.json"
+  if [[ ! -e "$session_file" && -f "$template" ]]; then
+    mkdir -p "${session_file%/*}"
+    cp -p --no-clobber "$template" "$session_file"
+  fi
+fi
+
+rt="${TMPDIR:-/tmp}/herdr-${USER}-$this_host"
+mkdir -p "$rt"
+chmod 700 "$rt"
+export HERDR_SOCKET_PATH="${HERDR_SOCKET_PATH:-$rt/herdr.sock}"
+export HERDR_CLIENT_SOCKET_PATH="${HERDR_CLIENT_SOCKET_PATH:-$rt/herdr-client.sock}"
+
+exec "$REAL_BIN" "$@"
