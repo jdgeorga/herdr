@@ -78,27 +78,60 @@ flags. Symlink it if you want it on `PATH`:
 ln -sf ~/herdr/scripts/frontera/herdr-attach.sh ~/.local/bin/herdr-attach
 ```
 
-Two things it handles that a naive `ssh node herdr` does not:
-
-- **The socket must be node-local.** herdr defaults to `~/.config/herdr/herdr.sock`, and
-  `/home1` is Lustre — shared across every login and compute node. A socket file visible from
-  a host where the server process does not exist is exactly the failure mode that bites
-  `tailscaled` here: a liveness check on a sibling node sees the file, concludes nothing is
-  running, and starts a second server against the same state. The script points
-  `HERDR_SOCKET_PATH` at `/tmp`.
-- **It must not pass `--session`.** In `src/session.rs`, `active_api_socket_path()` checks
-  `explicit_session_requested()` **before** reading `HERDR_SOCKET_PATH`, so naming a session
-  silently discards the override and puts the socket back on Lustre. Distinct socket paths
-  give the same effect; the client socket is derived from the API socket, so one variable is
-  enough.
-
 Inherited caveat, same as `idev-attach`: a server started cold over ssh gets a bare login
 environment — 0 `SLURM_*` vars, versus 41 in one started from inside the job step — so its
 panes cannot run `ibrun`/`srun`. The script warns and continues. For job-aware panes, start
 herdr from inside the job shell.
 
-Run herdr on one host at a time. The socket is node-local now, but the state directory under
-`~/.config/herdr` is still on shared `/home1`.
+### Why herdr's state must not live on /home1
+
+This is the sharpest Frontera-specific hazard in the whole setup, and it is destructive.
+
+herdr's data dir defaults to `~/.config/herdr`, and `/home1` is Lustre — shared across every
+login and compute node. So the server's **socket file is visible from hosts where the server
+process does not exist.** Connecting to such a socket returns `ECONNREFUSED`, and
+`src/ipc.rs::prepare_socket_path()` classifies that as stale:
+
+```rust
+Err(err) if stale_socket_connect_error(err.kind()) => {}   // ConnectionRefused | NotFound | TimedOut
+...
+fs::remove_file(path)
+```
+
+**It deletes the file and starts a second server.** Your original server keeps running with
+your panes inside it, now permanently unreachable. Confirmed on 2026-08-11 by creating a unix
+socket on `/home1` from a compute node: `login1` and `login2` both saw the file and both got
+`errno=111 ECONNREFUSED`. It is the same trap that bites `tailscaled` here.
+
+Beyond the socket, `session.json`, both logs, and `.plugins.lock` would also be written by two
+servers at once.
+
+The fix is to move the whole data dir to node-local `/tmp`, keeping `config.toml` shared:
+
+```bash
+XDG_CONFIG_HOME=/tmp/herdr-$USER-xdg \
+HERDR_CONFIG_PATH=$HOME/.config/herdr/config.toml \
+  herdr
+```
+
+`herdr-attach.sh` does this for you, and a `herdr()` function in `~/.bashrc` does it for bare
+invocations — which matters, because `herdr-attach` only protects the paths that go through it,
+and a bare `herdr` typed on the compute node would otherwise still use the `/home1` socket.
+
+Three things worth knowing about that arrangement:
+
+- **Do not `export XDG_CONFIG_HOME` globally.** It is not herdr-specific: `gh`, `gcloud`,
+  `tmux`, `yazi`, and `matplotlib` all keep config under `~/.config`, and a global export
+  breaks `gh` auth. Scope it per-invocation — that is why `.bashrc` defines a function rather
+  than setting a variable.
+- **Do not pass `--session`.** `active_api_socket_path()` checks `explicit_session_requested()`
+  **before** consulting the environment, so naming a session bypasses the relocation entirely.
+  Distinct `XDG_CONFIG_HOME` dirs give the same "named instance" effect.
+- **Layout no longer persists across jobs.** `session.json` holds workspaces and pane numbering;
+  on `/tmp` it dies with the node. That is the accepted cost of isolation.
+
+Run herdr on one host at a time regardless. Isolation prevents corruption; it does not merge
+two servers into one.
 
 ## The SLURM sidebar
 
