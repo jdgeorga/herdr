@@ -1,0 +1,155 @@
+onboarding = false
+[theme]
+name = "gruvbox"
+auto_switch = false
+
+[ui]
+# Capture mouse input for Herdr's mouse UI (clicks, drags, wheel).
+mouse_capture = true
+# Pane scrollback lines per wheel notch.
+mouse_scroll_lines = 3
+
+# Agent panel ordering: attention queue rather than grouped by space.
+agent_panel_sort = "spaces"
+
+# Sidebar agent rows.
+#
+# The leading built-in "state_icon" is replaced by five custom metadata tokens
+# published by scripts/herdr-spinner.py, which animates the working state
+# instead of drawing a static dot. Exactly one token is ever set on a pane, so
+# only one renders; the split into five is what lets each state keep its own
+# colour, since a token style is fixed in config rather than per state.
+# Stop the daemon (scripts/herdr-spinner stop) and the column goes blank —
+# restore "state_icon" here to get the built-in dots back.
+#
+# Each $sp_* value is the whole left cluster in one string — state glyph, agent
+# symbol ("✳" claude, "◇" codex), and workspace label, e.g. "⠹ ✳ SETUP CONFIG".
+# Herdr joins separate row tokens with " · " and that separator is not
+# configurable, so one token is the only way to render those three without dots
+# between them. One colour therefore covers all three, and it tracks the state.
+# The built-in "agent" and "workspace" tokens are deliberately absent from these
+# rows: their content is already inside the token value.
+#
+# The daemon reports tokens for every agent pane, so these default rows carry
+# the animation for codex and anything else that isn't overridden below.
+[ui.sidebar.agents]
+rows = [
+  [
+    { token = "$sp_work", fg = "#d79921", bold = true },   # working  (animated)
+    { token = "$sp_idle", fg = "#928374" },                # idle
+    { token = "$sp_done", fg = "#b8bb26", bold = true },   # done
+    { token = "$sp_block", fg = "#fb4934", bold = true },  # blocked
+    { token = "$sp_unk", fg = "#665c54" },                 # unknown
+    "tab",
+  ],
+]
+
+# Claude Code and Codex share a two-line layout: the cluster plus tab, then
+# reported state and the stripped terminal/session title.
+[ui.sidebar.agents.rows_by_agent]
+# Herdr already joins tokens on a row with " · " — do not add separator tokens.
+claude = [
+  [
+    { token = "$sp_work", fg = "#d79921", bold = true },   # working  (animated)
+    { token = "$sp_idle", fg = "#928374" },                # idle
+    { token = "$sp_done", fg = "#b8bb26", bold = true },   # done
+    { token = "$sp_block", fg = "#fb4934", bold = true },  # blocked
+    { token = "$sp_unk", fg = "#665c54" },                 # unknown
+    "tab",
+  ],
+  ["state_text", "terminal_title_stripped"],
+]
+codex = [
+  [
+    { token = "$sp_work", fg = "#d79921", bold = true },   # working  (animated)
+    { token = "$sp_idle", fg = "#928374" },                # idle
+    { token = "$sp_done", fg = "#b8bb26", bold = true },   # done
+    { token = "$sp_block", fg = "#fb4934", bold = true },  # blocked
+    { token = "$sp_unk", fg = "#665c54" },                 # unknown
+    "tab",
+  ],
+  ["state_text", "terminal_title_stripped"],
+]
+
+# Monitoring navigation on one held modifier: ctrl+shift, then arrows.
+#   ← →  step through tabs
+#   ↑ ↓  step through agents
+#
+# Deliberately NOT prefix bindings. A prefix chord is ctrl+b then the key, which
+# cannot be hammered; these are direct terminal-mode shortcuts, so the modifier
+# can be held down and the arrows tapped. ctrl+shift+arrow uses the standard
+# xterm modifier encoding (CSI 1;6X), which iTerm2 sends without needing CSI-u.
+#
+# Nothing else claims ctrl+shift+arrow, so no pane app loses a key to this —
+# unlike ctrl+arrow, which would have taken word-jump away from the Claude Code
+# prompt, readline, and vim.
+#
+# Each action takes exactly one binding, so these REPLACE the tab defaults:
+# tab switching is no longer on prefix+n / prefix+p. prefix+1..9 still jumps
+# straight to a tab. Pane cycling is left alone and keeps prefix+tab and
+# prefix+shift+tab.
+[keys]
+previous_tab = "ctrl+shift+left"
+next_tab = "ctrl+shift+right"
+previous_agent = "ctrl+shift+up"
+next_agent = "ctrl+shift+down"
+
+# herdr-file-viewer plugin (github:smarzban/herdr-file-viewer).
+# Neither prefix+f nor prefix+shift+f is used by any default binding.
+[[keys.command]]
+key = "prefix+f"
+type = "plugin_action"
+command = "herdr-file-viewer.open-file-viewer"
+
+[[keys.command]]
+key = "prefix+shift+f"
+type = "plugin_action"
+command = "herdr-file-viewer.open-file-viewer-tab"
+
+# ---------------------------------------------------------------------------
+# SLURM jobs sidebar (fork-only feature; stock herdr ignores this section).
+# Provider script owns all SLURM knowledge -- edit it, not the Rust, to change
+# what is displayed. Changes take effect on the next 10s poll, no restart.
+# ---------------------------------------------------------------------------
+[ui.sidebar.list]
+enabled = true
+placement = "bottom"
+collapsed = true
+refresh_seconds = 10
+timeout_seconds = 5
+max_visible_rows = 12
+# The interpreter is deliberately NOT named here. herdr-jobs is a shim that
+# resolves a python >= 3.11 via site/lib/herdr-site.sh and applies the mandatory
+# -I -S flags itself, which keeps this file free of cluster-specific paths so it
+# can be tracked in git and symlinked into place on any cluster.
+# (-I -S matter because python startup can run a sitecustomize that prints to
+# stdout and corrupts the JSON payload herdr parses.)
+command = ["~/.config/herdr/scripts/herdr-jobs", "--mode", "{mode}"]
+modes = ["live", "history"]
+
+columns = [
+  { width = "fill", align = "left"  },   # directory label
+  { width = 3,      align = "right" },   # node count
+  { width = 7,      align = "right" },   # time left / requested
+]
+
+[ui.sidebar.list.styles]
+normal = "#ebdbb2"
+ok     = "#b8bb26"
+fail   = "#fb4934"
+warn   = "#fabd2f"
+muted  = "#928374"
+
+[[ui.sidebar.list.actions]]
+id = "cancel"
+label = "Cancel job"
+command = ["scancel", "--", "{id}"]
+confirm = "Cancel job {id} ({cell0})?"
+validate = { id = "^[0-9]+(_[0-9]+)?(\\+[0-9]+)?$" }
+
+[[ui.sidebar.list.actions]]
+id = "tail"
+label = "Tail log"
+command = ["tail", "-f", "--", "{log}"]
+target = "overlay"
+cwd = "{dir}"

@@ -1,0 +1,102 @@
+#!/bin/sh
+# Supervise the Herdr sidebar spinner daemon.
+#
+#   herdr-spinner start     start it if it is not already running (idempotent)
+#   herdr-spinner stop      stop it and clear the tokens it published
+#   herdr-spinner restart
+#   herdr-spinner status
+#
+# `start` is safe to call from a hook on every session launch. Single-instance
+# is enforced by the daemon itself, which holds an exclusive flock on the pid
+# file for its lifetime; a redundant start exits immediately without doing
+# anything. This script must NOT try to record the pid: it backgrounds
+# `setsid`, and `$!` is setsid's pid rather than python's, so a pid file
+# written here points at a process that has already exited — which silently
+# defeated the guard and let a new daemon spawn on every single hook call.
+
+set -eu
+
+dir="$(cd "$(dirname "$0")" && pwd)"
+daemon="$dir/herdr-spinner.py"
+# Per-node runtime state: ~/.config is shared across every login node, so an
+# unqualified pid/log would be contended by daemons on unrelated hosts.
+host="$(hostname -s 2>/dev/null || hostname)"
+pid_file="${HOME}/.config/herdr/herdr-spinner.${host}.pid"
+log_file="${HOME}/.config/herdr/herdr-spinner.${host}.log"
+
+# Echo the pid of the live daemon, or return 1. The daemon writes its own pid
+# into the lock file after taking the lock.
+running_pid() {
+  [ -f "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Guard against a recycled pid belonging to some unrelated process. Read
+  # /proc rather than shelling out to ps, which can take tens of seconds on a
+  # busy login node.
+  if [ -r "/proc/$pid/cmdline" ]; then
+    case "$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)" in
+      *herdr-spinner.py*) ;;
+      *) return 1 ;;
+    esac
+  fi
+  echo "$pid"
+}
+
+case "${1:-start}" in
+  start)
+    if running_pid >/dev/null; then
+      exit 0
+    fi
+    # The socket file lives on shared storage and exists on every login node,
+    # so its presence proves nothing. The daemon pings before doing any work
+    # and exits quietly if no server on THIS node answers.
+    [ -S "${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}" ] || exit 0
+    # Fully detach: a hook that starts this must not wait on the daemon, and
+    # the daemon must survive the pane that launched it. If this races another
+    # start, the loser exits on the flock.
+    if command -v setsid >/dev/null 2>&1; then
+      setsid python3 "$daemon" </dev/null >>"$log_file" 2>&1 &
+    else
+      nohup python3 "$daemon" </dev/null >>"$log_file" 2>&1 &
+    fi
+    ;;
+  stop)
+    pid="$(running_pid || true)"
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+      # Give it a moment to clear its tokens on the way out.
+      i=0
+      while [ "$i" -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    ;;
+  restart)
+    "$0" stop
+    # Wait for the flock to be released before the replacement claims it.
+    i=0
+    while [ "$i" -lt 30 ] && running_pid >/dev/null; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    "$0" start
+    ;;
+  status)
+    pid="$(running_pid || true)"
+    if [ -n "$pid" ]; then
+      echo "running (pid $pid)"
+    else
+      echo "not running"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "usage: $0 {start|stop|restart|status}" >&2
+    exit 2
+    ;;
+esac

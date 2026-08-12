@@ -1,0 +1,106 @@
+#!/bin/bash
+# List live stock herdr and herdr-slurm sessions across used login nodes.
+
+set -uo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+stock_wrapper="$(herdr_site_wrapper stock)"
+slurm_wrapper="$(herdr_site_wrapper slurm)"
+
+usage() {
+  cat <<EOF
+Usage: herdr ls [host ...]
+       herdr-slurm ls [host ...]
+
+With no host arguments, discovers nodes from saved herdr-*/slurm-* sessions and
+per-node spinner records. Only currently running sessions are listed; saved but
+stopped sessions are omitted.
+
+This cluster's login nodes are matched by: ${HERDR_SITE_LOGIN_PATTERN}
+EOF
+}
+
+probe() {
+  local variant session command output protocol socket
+  variant="$1"
+  session="$2"
+  command="$3"
+  output="$(timeout 3s "$command" status server 2>&1 || true)"
+  grep -Fqx 'status: running' <<<"$output" || return 0
+  protocol="$(awk '/^protocol:/ {print $2; exit}' <<<"$output")"
+  socket="$(awk '/^socket:/ {$1=""; sub(/^ /, ""); print; exit}' <<<"$output")"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(hostname -s)" "$session" "$variant" "${protocol:--}" "${socket:--}"
+}
+
+probe_local() {
+  local host stock_pid slurm_pid
+  host="$(hostname -s)"
+  probe stock "herdr-$host" "$stock_wrapper" &
+  stock_pid=$!
+  probe slurm "slurm-$host" "$slurm_wrapper" &
+  slurm_pid=$!
+  wait "$stock_pid"
+  wait "$slurm_pid"
+}
+
+local_only=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --local) local_only=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if herdr_site_is_login_host "$1"; then
+        herdr_site_add_host "$1"
+      else
+        echo "herdr ls: not a login node of this cluster: $1" >&2
+        echo "  expected a host matching ${HERDR_SITE_LOGIN_PATTERN}" >&2
+        usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+  shift
+done
+
+if (( local_only )); then
+  probe_local
+  exit 0
+fi
+
+herdr_site_hosts
+rows=""
+result_dir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ls.XXXXXXXX")"
+trap 'rm -rf "$result_dir"' EXIT
+
+# Probe in parallel so stale or unreachable login nodes cost one timeout total,
+# rather than one timeout per remembered node.
+herdr_site_fanout 8s "$result_dir" ls
+
+for host in "${HERDR_SITE_HOSTS[@]}"; do
+  [[ -r "$result_dir/$host.out" ]] || continue
+  output="$(<"$result_dir/$host.out")"
+  if [[ -n "$output" ]]; then
+    rows+="$output"$'\n'
+  fi
+done
+
+if [[ -z "$rows" ]]; then
+  echo "No running herdr sessions found."
+else
+  printf '%-9s %-18s %-7s %-8s %s\n' NODE SESSION VARIANT PROTOCOL SOCKET
+  while IFS=$'\t' read -r node session variant protocol socket; do
+    [[ -n "$node" ]] || continue
+    printf '%-9s %-18s %-7s %-8s %s\n' \
+      "$node" "$session" "$variant" "$protocol" "$socket"
+  done < <(printf '%s' "$rows" | sort -V)
+fi
+
+if (( ${#HERDR_SITE_UNAVAILABLE[@]} > 0 )); then
+  printf 'Unavailable nodes: %s\n' "${HERDR_SITE_UNAVAILABLE[*]}" >&2
+  exit 1
+fi

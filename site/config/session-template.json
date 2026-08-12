@@ -1,0 +1,177 @@
+{
+  "version": 3,
+  "workspaces": [
+    {
+      "id": "w1",
+      "custom_name": "SETUP CONFIG",
+      "identity_cwd": "@HERDR_SITE_WORKDIR@",
+      "public_pane_numbers": {
+        "1": 10,
+        "2": 15,
+        "3": 16
+      },
+      "next_public_pane_number": 17,
+      "public_tab_numbers": [
+        1,
+        6
+      ],
+      "next_public_tab_number": 7,
+      "tabs": [
+        {
+          "custom_name": "Visual Layout",
+          "layout": {
+            "Pane": 1
+          },
+          "panes": {
+            "1": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 1,
+          "root_pane": 1
+        },
+        {
+          "custom_name": "Color Config",
+          "layout": {
+            "Split": {
+              "direction": "Horizontal",
+              "ratio": 0.5,
+              "first": {
+                "Pane": 2
+              },
+              "second": {
+                "Pane": 3
+              }
+            }
+          },
+          "panes": {
+            "2": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            },
+            "3": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 2,
+          "root_pane": 2
+        }
+      ],
+      "active_tab": 1
+    },
+    {
+      "id": "w2",
+      "custom_name": "UED",
+      "identity_cwd": "@HERDR_SITE_WORKDIR@",
+      "public_pane_numbers": {
+        "5": 2,
+        "4": 6
+      },
+      "next_public_pane_number": 7,
+      "public_tab_numbers": [
+        1,
+        2
+      ],
+      "next_public_tab_number": 3,
+      "tabs": [
+        {
+          "custom_name": "Sys3",
+          "layout": {
+            "Pane": 4
+          },
+          "panes": {
+            "4": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 4,
+          "root_pane": 4
+        },
+        {
+          "custom_name": "Cleanup crew",
+          "layout": {
+            "Pane": 5
+          },
+          "panes": {
+            "5": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 5,
+          "root_pane": 5
+        }
+      ],
+      "active_tab": 0
+    },
+    {
+      "id": "w4",
+      "custom_name": null,
+      "identity_cwd": "@HERDR_SITE_WORKDIR@",
+      "public_pane_numbers": {
+        "6": 1
+      },
+      "next_public_pane_number": 2,
+      "public_tab_numbers": [
+        1
+      ],
+      "next_public_tab_number": 2,
+      "tabs": [
+        {
+          "custom_name": null,
+          "layout": {
+            "Pane": 6
+          },
+          "panes": {
+            "6": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 6,
+          "root_pane": 6
+        }
+      ],
+      "active_tab": 0
+    },
+    {
+      "id": "w5",
+      "custom_name": null,
+      "identity_cwd": "@HERDR_SITE_WORKDIR@",
+      "public_pane_numbers": {
+        "7": 1
+      },
+      "next_public_pane_number": 2,
+      "public_tab_numbers": [
+        1
+      ],
+      "next_public_tab_number": 2,
+      "tabs": [
+        {
+          "custom_name": null,
+          "layout": {
+            "Pane": 7
+          },
+          "panes": {
+            "7": {
+              "cwd": "@HERDR_SITE_WORKDIR@"
+            }
+          },
+          "zoomed": false,
+          "focused": 7,
+          "root_pane": 7
+        }
+      ],
+      "active_tab": 0
+    }
+  ],
+  "active": 1,
+  "selected": 1,
+  "sidebar_width": 36,
+  "sidebar_section_split": 0.18644068,
+  "collapsed_space_keys": [],
+  "jobs_collapsed": true,
+  "jobs_mode": "live"
+}

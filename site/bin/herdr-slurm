@@ -1,0 +1,119 @@
+#!/bin/bash
+# Launch the SLURM-jobs-sidebar fork of herdr, fully isolated from the stock
+# install so it cannot disturb a running herdr session.
+#
+#   config : ~/.config/herdr-slurm/config.toml   (not the stock config.toml)
+#   socket : node-local under $TMPDIR             (NOT $HOME -- home is shared
+#            across login nodes on many clusters, so a socket there collides
+#            between nodes)
+#   binary : the fork build, located by site resolution
+#
+# This is intended to be the default: `herdr` is installed as a symlink to this
+# script, so both names run the fork with identical config, session, and socket.
+# Stock upstream lives at `herdr-stock`, and `herdr-stock update` self-updates
+# that install without touching the fork.
+#
+# Cluster-specific paths come from site/lib/herdr-site.sh -- see `herdr site`.
+
+set -euo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+this_host="$(hostname -s)"
+FORK_BIN="$HERDR_SITE_FORK_BIN"
+
+case "${1:-}" in
+  cleanup|ls|health|reap|sync)
+    command="$1"
+    shift
+    exec "$(herdr_site_wrapper "$command")" "$@"
+    ;;
+  site)
+    shift
+    if (( $# > 0 )); then
+      echo "herdr site: unexpected argument: $1" >&2
+      exit 2
+    fi
+    herdr_site_report
+    exit 0
+    ;;
+  update)
+    # Upstream's updater downloads a prebuilt binary from herdr.dev and swaps it
+    # in place. On this fork that reverts to stock herdr and loses the jobs
+    # sidebar until the next rebuild, so it is blocked here.
+    cat >&2 <<'EOF'
+herdr-slurm: `update` is disabled on the fork.
+
+`herdr update` replaces the binary with upstream's prebuilt release. It does
+not rebase source, and on this fork it would drop the SLURM jobs sidebar.
+
+To pull in upstream changes:   herdr sync
+To update the stock install:   herdr-stock update
+EOF
+    exit 2
+    ;;
+  --help|-h)
+    cat <<EOF
+Login-node management commands:
+  herdr-slurm ls [host ...]          List live herdr sessions across login nodes
+  herdr-slurm cleanup [--dry-run]    Stop herdr on remembered login nodes
+  herdr-slurm health [host ...]      Report memory, OOM, processes, and large /tmp use
+  herdr-slurm reap [options]         Find runaways (dry-run unless explicitly enabled)
+  herdr-slurm site                   Show resolved cluster paths and where each came from
+
+Fork maintenance:
+  herdr sync [options]               Rebase the fork onto upstream and rebuild
+  herdr update                       Disabled on the fork; use \`sync\` instead
+
+\`herdr\` and \`herdr-slurm\` are the same fork build. Stock upstream is
+\`herdr-stock\`.
+
+Run \`herdr-slurm <command> --help\` for details. These commands also work
+through \`herdr\` and operate on both herdr variants.
+Docs: $HERDR_SITE_REPO/site/README.md
+
+Upstream herdr help:
+EOF
+    exec "$FORK_BIN" --help
+    ;;
+esac
+
+if [[ ! -x "$FORK_BIN" ]]; then
+  echo "herdr-slurm: fork binary not found at $FORK_BIN" >&2
+  echo "  build it with:  cd $HERDR_SITE_REPO && source ./build-env.sh && cargo build --release -j 8" >&2
+  echo "  or point at an existing build:  HERDR_SITE_FORK_BIN=/path/to/herdr" >&2
+  echo "  see also:  herdr site" >&2
+  exit 1
+fi
+
+export HERDR_CONFIG_PATH="${HERDR_CONFIG_PATH:-$HOME/.config/herdr-slurm/config.toml}"
+
+# herdr keeps persistent session state under its config directory, independently
+# of HERDR_CONFIG_PATH and the socket overrides below.  Give each login node a
+# named session so concurrent stock/fork instances (or forks on two login nodes)
+# cannot overwrite the same session.json.
+export HERDR_SESSION="${HERDR_SESSION:-slurm-$this_host}"
+
+# Seed only a brand-new node's default session. The template contains layout,
+# labels, working directories, and sidebar state, but no live processes. An
+# existing per-node session is never overwritten. Override or disable the seed
+# with HERDR_SLURM_TEMPLATE=/path/to/template.json or /dev/null.
+if [[ $# -eq 0 || ( $# -eq 1 && "$1" == "server" ) ]]; then
+  template="${HERDR_SLURM_TEMPLATE:-$HOME/.config/herdr-slurm/session-template.json}"
+  session_file="$HOME/.config/herdr/sessions/$HERDR_SESSION/session.json"
+  if [[ ! -e "$session_file" && -f "$template" ]]; then
+    mkdir -p "${session_file%/*}"
+    cp -p --no-clobber "$template" "$session_file"
+  fi
+fi
+
+# Per-node runtime state: keyed by host so two login nodes never share a socket.
+_rt="${TMPDIR:-/tmp}/herdr-slurm-${USER}-$this_host"
+mkdir -p "$_rt"
+chmod 700 "$_rt"
+export HERDR_SOCKET_PATH="${HERDR_SOCKET_PATH:-$_rt/herdr.sock}"
+export HERDR_CLIENT_SOCKET_PATH="${HERDR_CLIENT_SOCKET_PATH:-$_rt/herdr-client.sock}"
+
+exec "$FORK_BIN" "$@"

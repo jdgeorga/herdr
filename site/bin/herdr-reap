@@ -1,0 +1,194 @@
+#!/bin/bash
+# Conservatively find or explicitly reap runaway process groups across nodes.
+
+set -uo pipefail
+
+_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source=../lib/herdr-site.sh
+. "$(dirname -- "$_self")/../lib/herdr-site.sh"
+
+usage() {
+  cat <<EOF
+Usage: herdr reap [--kill] [--delete-claude-tmp] [host ...]
+       herdr-slurm reap [--kill] [--delete-claude-tmp] [host ...]
+
+Dry-run is the default. A process group is a candidate only when it contains at
+least 128 user-owned processes and contains no herdr, systemd, sshd, or reap
+coordinator process. Targets are rediscovered and validated on each node.
+
+  --kill               TERM, then KILL, validated runaway process groups
+  --delete-claude-tmp  delete validated user-owned Claude /tmp directories >=5G
+
+The deletion flag is independent and must be supplied explicitly; --kill never
+deletes files. Claude directories referenced as a cwd by a live process are not
+eligible. Saved herdr sessions and herdr runtime files are never modified.
+
+This cluster's login nodes are matched by: ${HERDR_SITE_LOGIN_PATTERN}
+EOF
+}
+
+protected_pgids() {
+  local pid="$$" ppid pgid
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ "$pgid" =~ ^[0-9]+$ ]] && printf '%s\n' "$pgid"
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ "$ppid" =~ ^[0-9]+$ ]] || break
+    pid="$ppid"
+  done | sort -nu
+}
+
+find_groups() {
+  local uid="$1" protected
+  protected="$(protected_pgids)"
+  # Do not request full args: reading a wedged process's /proc/PID/cmdline can
+  # itself hang ps. Process names plus PGID/count are sufficient here.
+  ps -u "$uid" -o pid=,pgid=,rss=,etimes=,comm= 2>/dev/null | \
+    awk -v protected="$protected" '
+      BEGIN {split(protected,a,"\n"); for (i in a) protect[a[i]]=1}
+      {
+        pid=$1; pgid=$2; rss=$3; age=$4; comm=$5
+        count[pgid]++; mem[pgid]+=rss
+        if (age > oldest[pgid]) oldest[pgid]=age
+        if (!(pgid in cmd)) cmd[pgid]=comm
+        if (comm ~ /^(herdr|herdr-bin|systemd|sshd)$/)
+          unsafe[pgid]=1
+      }
+      END {
+        for (p in count)
+          if (p > 1 && count[p] >= 128 && !protect[p] && !unsafe[p])
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", p, count[p], mem[p],
+                   oldest[p], cmd[p], "-"
+      }' | sort -n
+}
+
+find_claude_dirs() {
+  local uid="$1" path real bytes busy pid cwd
+  while IFS= read -r -d '' path; do
+    [[ -O "$path" ]] || continue
+    real="$(readlink -f -- "$path" 2>/dev/null || true)"
+    [[ "$real" == /tmp/claude-[0-9]* && "$real" == "$path" ]] || continue
+    bytes="$(timeout 8s du -sx --block-size=1 "$real" 2>/dev/null | awk '{print $1}')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes >= 5368709120 )) || continue
+    busy=0
+    while read -r pid; do
+      cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+      if [[ "$cwd" == "$real" || "$cwd" == "$real"/* ]]; then busy=1; break; fi
+    done < <(pgrep -u "$uid" 2>/dev/null || true)
+    (( busy == 0 )) && printf '%s\t%s\n' "$bytes" "$real"
+  done < <(find /tmp -maxdepth 1 -mindepth 1 -type d -user "$uid" \
+           -name 'claude-[0-9]*' -print0 2>/dev/null)
+}
+
+reap_local() {
+  local host uid pgid count rss age command sample bytes path
+  local -a remaining=()
+  host="$(hostname -s)"
+  uid="$(id -u)"
+
+  while IFS=$'\t' read -r pgid count rss age command sample; do
+    [[ -n "$pgid" ]] || continue
+    if (( do_kill )); then
+      printf 'KILLING\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$host" "$pgid" "$count" "$rss" "$age" "$command" "$sample"
+      kill -TERM -- "-$pgid" 2>/dev/null || true
+      remaining+=("$pgid")
+    else
+      printf 'WOULD_KILL\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$host" "$pgid" "$count" "$rss" "$age" "$command" "$sample"
+    fi
+  done < <(find_groups "$uid")
+
+  if (( do_kill && ${#remaining[@]} > 0 )); then
+    sleep 3
+    for pgid in "${remaining[@]}"; do
+      # Signal only if the group still exists and is still a validated target.
+      if find_groups "$uid" | awk -F '\t' -v p="$pgid" '$1 == p {found=1} END {exit !found}'; then
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  while IFS=$'\t' read -r bytes path; do
+    [[ -n "$path" ]] || continue
+    if (( delete_tmp )); then
+      # Revalidate ownership, canonical location, size, and lack of live cwd
+      # immediately before removing this one exact directory.
+      if find_claude_dirs "$uid" | awk -F '\t' -v p="$path" '$2 == p {found=1} END {exit !found}'; then
+        rm -rf --one-file-system -- "$path"
+        printf 'DELETED\t%s\t%s\t%s\n' "$host" "$bytes" "$path"
+      fi
+    else
+      printf 'WOULD_DELETE\t%s\t%s\t%s\n' "$host" "$bytes" "$path"
+    fi
+  done < <(find_claude_dirs "$uid")
+}
+
+do_kill=0
+delete_tmp=0
+local_only=0
+while (( $# > 0 )); do
+  case "$1" in
+    --kill) do_kill=1 ;;
+    --delete-claude-tmp) delete_tmp=1 ;;
+    --local) local_only=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if herdr_site_is_login_host "$1"; then
+        herdr_site_add_host "$1"
+      else
+        echo "herdr reap: not a login node of this cluster: $1" >&2
+        echo "  expected a host matching ${HERDR_SITE_LOGIN_PATTERN}" >&2
+        usage >&2
+        exit 2
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [[ "${HERDR_ENV:-0}" == 1 && ( $do_kill -eq 1 || $delete_tmp -eq 1 ) ]]; then
+  echo 'herdr reap: run active cleanup from a normal login shell, not a herdr pane' >&2
+  exit 2
+fi
+
+if (( local_only )); then
+  reap_local
+  exit 0
+fi
+
+herdr_site_hosts
+result_dir="$(mktemp -d "${TMPDIR:-/tmp}/herdr-reap.XXXXXXXX")"
+trap 'rm -rf "$result_dir"' EXIT
+
+remote_flags=()
+(( do_kill )) && remote_flags+=(--kill)
+(( delete_tmp )) && remote_flags+=(--delete-claude-tmp)
+herdr_site_fanout 20s "$result_dir" reap ${remote_flags[@]+"${remote_flags[@]}"}
+
+actions="$(cat "$result_dir"/*.out 2>/dev/null || true)"
+if [[ -z "$actions" ]]; then
+  echo 'No reap candidates found.'
+else
+  printf '%-13s %-9s %8s %7s %9s %9s %-16s %s\n' ACTION NODE TARGET COUNT/SIZE RSS AGE COMMAND SAMPLE/PATH
+  while IFS=$'\t' read -r action node target count rss age command sample; do
+    case "$action" in
+      WOULD_KILL|KILLING)
+        printf '%-13s %-9s %8s %7s %9s %8ss %-16s %s\n' "$action" "$node" "$target" \
+          "$count" "$(awk -v n="$rss" 'BEGIN {printf "%.1fG", n/1048576}')" "$age" "$command" "$sample"
+        ;;
+      WOULD_DELETE|DELETED)
+        printf '%-13s %-9s %8s %7s %9s %9s %-16s %s\n' "$action" "$node" '-' \
+          "$(awk -v n="$target" 'BEGIN {printf "%.1fG", n/1073741824}')" '-' '-' '-' "$count"
+        ;;
+    esac
+  done <<<"$actions"
+fi
+
+if (( !do_kill && !delete_tmp )); then
+  echo 'Dry-run only. Use --kill and/or --delete-claude-tmp to take action.'
+fi
+if (( ${#HERDR_SITE_UNAVAILABLE[@]} > 0 )); then
+  printf 'Unavailable nodes: %s\n' "${HERDR_SITE_UNAVAILABLE[*]}" >&2
+  exit 1
+fi
