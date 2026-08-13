@@ -56,18 +56,21 @@ cap and a tight space quota.
 
 ### ulimits
 
-| | compute node `i614-013` | login node |
-|---|---|---|
-| `ulimit -u` | **16384** | not measured — see "What I could not verify" |
-| `ulimit -v` | **unlimited** | not measured |
-| `ulimit -n` | 256000 | not measured |
+Both measured, the login-node column on `login2`:
 
-Frontera's hard rule — *never build or run anything thread-heavy on a login node*, where
-`ulimit -u` is 300 and counts **threads not processes** — is still the right habit here, but
-Vista's compute-node limit is 16384 and the release build peaked around 560 threads without
-trouble. Your own `~/.bashrc` carries comments asserting Vista login nodes cap `ulimit -v` at
-8GB and `ulimit -u` at 100. **Those are your notes, not my measurements**; I could not reach a
-login node (see below).
+| | compute node `i614-013` | login node `login2` |
+|---|---|---|
+| `ulimit -u` | **16384** | **100** (soft *and* hard) |
+| `ulimit -v` | **unlimited** | **8388608 KB = 8 GiB** (soft *and* hard) |
+| `ulimit -n` | 256000 | 16384 |
+| cores | 144 | 144 |
+
+Frontera's hard rule — *never build or run anything thread-heavy on a login node* — holds here
+and is if anything tighter: Frontera allows 300, Vista allows **100**, and the limit is a hard
+one so it cannot be raised. It counts tasks (threads), not processes: `login2` was sitting at
+**51 threads across only 16 processes**, i.e. half the budget gone at idle. A single `claude` is
+~40 threads. The compute node is where work belongs — `ulimit -u` there is 16384, and the
+release build peaked around 560 threads without trouble.
 
 ### `nproc` lies here
 
@@ -184,8 +187,56 @@ herdr-attach -j 909983      # pick a specific job
 ```
 
 Job auto-pick order is: the only RUNNING job, else the one named `idv*`, else list candidates
-and exit. **Vista's `idev` does name jobs `idv*`** — measured `idv18291` for job 909983 — so
-the Frontera heuristic transfers unchanged.
+and exit. **Vista's `idev` does name jobs `idv*`** — measured `idv18291` and `idv78113` — so the
+Frontera heuristic transfers unchanged.
+
+### Killing stray ssh processes on a login node can cancel your job
+
+This one is destructive and was learned the hard way: a broad
+`for p in $(pgrep -u $USER -x ssh); do kill -9 $p; done` on `login2` **cancelled job 909983.**
+
+`idev` holds the allocation open from the login node and keeps an ssh into the compute node:
+
+```
+$ ps -o args= -p <pid>
+ssh -Y -A -o StrictHostKeyChecking no i614-051
+```
+
+Kill that and the job dies with it — `sacct` showed `CANCELLED`, and the compute node then
+refused connections with `Access denied: user jdgeorga has no active jobs on this node`. On a
+compute node `pgrep -x ssh` matches only your own test connections, so the same habit looks
+safe there and is not safe on a login node.
+
+When cleaning up an attach, kill the PID you captured at launch, and print what it is before
+killing it:
+
+```bash
+# capture at launch
+herdr-attach & MY=$!
+# ... later, verify before killing
+ps -o args= -p "$MY"
+kill "$MY"
+```
+
+Nothing durable is lost if it happens — `session.json`, the binary and the toolchains are all
+on shared storage — but the live panes and the server go, and a new job on a different node gets
+a fresh per-host session name.
+
+### You cannot start a job-aware server from a login node
+
+The server must be created from **inside the job shell**, and there is no login-node shortcut.
+`ssh` into the compute node gives 0 `SLURM_*` vars, and joining the running job with
+`srun --jobid=<id> --overlap` does not work either — Vista's `job_submit` plugin rejects it as a
+fresh submission, demanding `-p`, then `-N`, then `-t` in turn:
+
+```
+--> Submission error: all jobs must have a queue name specified with "-p"
+--> Submission error: please define total node count with the "-N" option
+--> Submission error: all jobs must have a maximum runlimit defined with "-t"
+```
+
+Do not keep feeding it arguments to get past that — satisfying the plugin risks **allocating a
+second job** rather than joining the existing one. Type `herdr` in the idev shell instead.
 
 ### Why herdr's state must not live on `/home1`
 
@@ -262,15 +313,27 @@ srw------- 1 jdgeorga G-824957 0 herdr-client.sock
 srw------- 1 jdgeorga G-824957 0 herdr.sock
 ```
 
-**The one part of this I could not run myself:** confirming the path is absent from a login
-node. ssh from a compute node to `login1`/`login2` is MFA-blocked on Vista
-(`Permission denied (keyboard-interactive)`), so I could not reach one. A marker file is left
-at `/tmp/herdr-node-local-proof.txt` on `i614-013`; from a login node this must fail:
+And confirmed from the other side — this is the measurement the whole design rests on. Run on
+`login2` while a server was live on the compute node:
 
-```bash
-ls -l /tmp/herdr-slurm-$USER-i614-013/     # expect: No such file or directory
-cat /tmp/herdr-node-local-proof.txt        # expect: No such file or directory
 ```
+$ ls -l /tmp/herdr-slurm-jdgeorga-i614-013/
+ls: cannot access '/tmp/herdr-slurm-jdgeorga-i614-013/': No such file or directory
+
+$ cat /tmp/herdr-node-local-proof.txt          # marker written on the compute node
+cat: /tmp/herdr-node-local-proof.txt: No such file or directory
+
+$ findmnt -no SOURCE,FSTYPE,TARGET /tmp        # login2 has its OWN /tmp volume
+/dev/mapper/rootvg01-lv_tmp xfs /tmp
+
+$ ls -ld /tmp/herdr-slurm-*                    # and its own host-keyed dir
+drwx------ 2 jdgeorga G-824957 6 /tmp/herdr-slurm-jdgeorga-login2
+```
+
+The compute node's socket is invisible from the login node, so `prepare_socket_path()` can never
+see it, never classify it as stale, and never delete it. The separate
+`herdr-slurm-jdgeorga-login2` directory is the `$(hostname -s)` key in the path formula doing
+exactly its job.
 
 ### The cold-start asymmetry — measured on Vista
 
@@ -314,10 +377,42 @@ times came back to the same pane with the same scrollback — a marker string
 `VISTA-HERDR-PROOF-909983-A1B2C3` rendered on screen in all three attaches, with the live jobs
 row ticking down (`11:31` → `11:28` → `11:27`).
 
-To force the ssh branch on a single-node allocation (`herdr-attach` runs locally when
-`hostname -s` already equals the target node), a `hostname` shim was put on `PATH` returning
-`login9`. The transport exercised was genuine: `ssh -t i614-013 <script>`, real remote bash,
-real `~/.bashrc`.
+That first round was run from the compute node itself. To force the ssh branch there
+(`herdr-attach` runs locally when `hostname -s` already equals the target node) a `hostname`
+shim returning `login9` was put on `PATH`; everything else was genuine.
+
+**Then it was redone from a real login node**, which is the case that actually matters. From
+`login2`, against job 910283 on `i614-051` with a server started from inside the idev shell:
+
+```
+herdr-attach -n     -> job 910283 (idv78113): i614-051, 11:58:25 left
+                       would run: ssh -t i614-051 '<script as the command argument>'
+attach #1           -> marker LOGIN2-REATTACH-910283-174000 on screen,
+                       pane reporting host=i614-051 slurm=41 job=910283,
+                       live jobs row, NO cold-start warning
+kill my ssh         -> server survives
+attach #2           -> same panes, same scrollback, same marker
+```
+
+The server was provably the *same process* across both attaches, not a restart:
+
+```
+pid=1896931  starttime_ticks=905807513  lstart=Thu Aug 13 17:39:41 2026   (attach #1)
+pid=1896931  starttime_ticks=905807513                                    (attach #2)
+server count: 1
+```
+
+And the load-bearing hazard is disproved from the far side. From `login2`:
+
+```
+$ ls -l /tmp/herdr-slurm-jdgeorga-i614-051/
+ls: cannot access ...: No such file or directory
+```
+
+The compute node's socket is **not visible from the login node**, so the cross-host
+stale-socket deletion cannot happen. `login2` has its own separate
+`/tmp/herdr-slurm-jdgeorga-login2/`, which is the host-keying in the path formula working as
+intended.
 
 ### State across job endings
 
@@ -376,19 +471,26 @@ overriding the prefix alone leaves a stale pattern and does nothing. The probe s
 129.114.63.161 and .162 — but `hostname -s` after login is `login1`/`login2`, which the pattern
 matches.
 
-### Consequence of pinning `LOGIN_PATTERN`: the fan-out commands are blind from a compute node
+### The multi-host fan-out commands do not work on Vista at all
 
 `herdr ls` and `herdr health` with no arguments discover hosts and drop anything not matching
 `^login[0-9]+$`. From `i614-013` that discovers **zero** hosts, so both print an empty table.
 This is correct behaviour given the pin, not a bug, but it is surprising.
 
-There is a second, more fundamental reason the multi-host forms are unusable from a compute
-node, and it would bite even with a permissive pattern: `herdr_site_fanout()` uses
-`ssh -o BatchMode=yes`, and **Vista requires MFA for login nodes**. From `i614-013`, both login
-nodes give `Permission denied (keyboard-interactive)`, so `BatchMode=yes` can never succeed;
+There is a second, more fundamental reason the multi-host forms do not work, and it would bite
+even with a permissive pattern: `herdr_site_fanout()` uses `ssh -o BatchMode=yes`, and **Vista
+requires MFA for login nodes.** Measured in both directions:
+
+```
+i614-013 -> login1/login2 :  Permission denied (keyboard-interactive)
+login2   -> login1        :  Permission denied (keyboard-interactive)
+login2   -> i614-051      :  works (this is the direction herdr-attach needs)
+```
+
+So `BatchMode=yes` can never reach a login node **from anywhere**, not just from a compute node:
 every login host lands in `HERDR_SITE_UNAVAILABLE` and the command exits nonzero. Treat
-`herdr ls`, `herdr health`, `herdr cleanup` and `herdr reap` as **`--local`-only on Vista when
-run from a compute node.** Do not patch `site/` for this. Use `--local`:
+`herdr ls`, `herdr health`, `herdr cleanup` and `herdr reap` as **`--local`-only on Vista,
+everywhere.** Do not patch `site/` for this. Use `--local`:
 
 ```
 $ herdr ls --local
@@ -402,23 +504,36 @@ Lines 80 and 251 guard `"${arr[@]}"` on a possibly-empty array with
 bash 4.2.46 where `set -u` plus `"${empty_array[@]}"` is an unbound-variable error that aborts
 every `site/bin` command at startup. **Do not "simplify" them away** — that breaks Frontera.
 
-### `herdr health` actually works here
+### `herdr health` reads real numbers here — but its TASKLIMIT lies on a login node
 
 Frontera is cgroup v1 with an unreadable per-user slice, so `herdr health` returns zeroed
 columns — worse than no check, and why Frontera needs `frontera-limits.sh`. Vista is cgroup v2
-and the probe's v2 branch resolves a real, readable directory, so **no `vista-limits.sh` is
-needed and none is provided.** Measured directly:
+on both node types and the probe's v2 branch resolves a real, readable directory, so **no
+`vista-limits.sh` is needed and none is provided.** Measured directly:
 
 ```
 /sys/fs/cgroup/user.slice/user-878254.slice/memory.current  6670843904
                                             pids.current    28
                                             pids.max        160525
 
-$ herdr health --local
+$ herdr health --local        # compute node i614-013
 SUMMARY  i614-013  10568794112  max  31  160525  0  -
+
+$ herdr health --local        # login2
+SUMMARY  login2    1946222592   max  53  160525  0  -
 ```
 
-Real numbers, matching a node genuinely using ~9.8G and ~31 tasks.
+Memory and task *counts* are genuine in both. **The TASKLIMIT column is not trustworthy on a
+login node.** It reports the cgroup's `pids.max` of 160525, but the binding constraint there is
+`ulimit -u = 100` — hard. So the row above reads "53 of 160525" when the truth is **53 of 100**,
+which is worse than no number at all: it says you have room when you are half out.
+
+This is Frontera's failure mode reappearing for a different reason — not an unreadable cgroup,
+but a cgroup whose limit is not the real ceiling. `herdr_site_cgroup_read()` has no way to know
+that; the ulimit is invisible to it. On the compute node the two agree well enough to ignore
+(`pids.max` 160525 vs `ulimit -u` 16384, and real usage is orders below both). On a login node,
+read `ulimit -u` and `ps -u $USER -L --no-headers | wc -l` yourself instead — which is what the
+thread-quota guard in `~/.bashrc` already does.
 
 ### The sidebar provider
 
@@ -598,20 +713,9 @@ see an inscrutable undefined-reference at the final link, add
 
 Stated plainly rather than inherited from the Frontera README:
 
-- **`herdr-attach` from an actual login node.** ssh from a compute node to `login1`/`login2` is
-  MFA-blocked on Vista (`Permission denied (keyboard-interactive)`), so the login → compute
-  direction was exercised via a real-ssh loopback to the compute node with a spoofed
-  `hostname`. Every element is genuine except the source host. Run this yourself from `login1`,
-  then again from `login2`:
-
-  ```bash
-  herdr-attach -n     # expect: job <id> (idv*): i614-013, <time> left
-  herdr-attach        # expect: your session, same panes
-  ls -l /tmp/herdr-slurm-$USER-i614-013/   # expect: No such file or directory
-  ```
-
-- **Login-node `ulimit -u` / `ulimit -v`.** Same reason. Your `~/.bashrc` asserts 100 and 8GB;
-  unconfirmed by me.
+- **Whether `herdr-attach` works from `login1`.** It was verified end to end from `login2`
+  (twice, with the disconnect in between). `login1` was not used as a source host, but nothing in
+  the path is login-node-specific and both match `^login[0-9]+$`.
 - **The allocation actually ending.** Job 909983 had ~11h left. Persistence was tested by
   killing the server and deleting the sockets, which is the same code path but not the same
   event.
@@ -626,8 +730,10 @@ Stated plainly rather than inherited from the Frontera README:
   same failure shape as Frontera, arrived at differently. If you start using `sbatch`, re-run
   the cgroup reads there and pin `HERDR_SITE_CGROUP_DIR` in `site.env` if needed rather than
   patching `site/`.
-- **`curl`/`wget` from a login node.** Both work from the compute node, which is where
-  dependency fetches happen.
+Unlike Frontera, where the system `curl` fails all TLS and `wget` is mandatory, **both work on
+Vista from both node types** — `curl 7.76.1` with OpenSSL 3.5.1 and `wget 1.21.1` each reached
+`https://github.com` from `i614-013` and from `login2`. So no `wget`-only workaround is needed
+anywhere, and dependency fetches on the compute node are fine.
 
 ## Fragile spots
 
