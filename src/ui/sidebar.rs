@@ -2754,8 +2754,11 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let active_row = app.view.workspace_card_areas[0].rect.y;
         let selected_row = app.view.workspace_card_areas[1].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -2784,8 +2787,11 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let active_row = app.view.workspace_card_areas[0].rect.y;
         let inactive_row = app.view.workspace_card_areas[1].rect.y;
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        let layout = compute_expanded_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
 
         assert_eq!(
@@ -2795,7 +2801,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
 
         app.selected = 1;
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         assert_eq!(
             terminal.backend().buffer()[(0, active_row)].bg,
@@ -2809,7 +2817,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         app.palette = crate::app::state::Palette::catppuccin();
         app.selected = 0;
         terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .draw(|frame| {
+                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &layout)
+            })
             .unwrap();
         assert_eq!(
             terminal.backend().buffer()[(0, active_row)].bg,
@@ -2827,8 +2837,9 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         app.mode = Mode::Navigate;
         let area = Rect::new(0, 0, 5, 8);
         let mut terminal = Terminal::new(TestBackend::new(5, 8)).unwrap();
+        let layout = compute_collapsed_sidebar_layout_for_test(&app, area);
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .unwrap();
 
         let (workspace_area, _, _) = collapsed_sidebar_sections(area);
@@ -2839,7 +2850,7 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
 
         app.selected = 1;
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .unwrap();
         assert_eq!(
             terminal.backend().buffer()[(workspace_area.x, workspace_area.y)].bg,
@@ -2853,7 +2864,7 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         app.palette = crate::app::state::Palette::catppuccin();
         app.selected = 0;
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &layout))
             .unwrap();
         assert_eq!(
             terminal.backend().buffer()[(workspace_area.x, workspace_area.y)].bg,

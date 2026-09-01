@@ -1527,18 +1527,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_workspace_ids_are_short_base32_handles() {
+    fn generated_workspace_ids_are_consecutive_base32_handles() {
         let first = generate_workspace_id();
         let second = generate_workspace_id();
 
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+        let first_number = decode_public_number(&first[1..]).expect("first workspace id");
+        let second_number = decode_public_number(&second[1..]).expect("second workspace id");
+        assert_eq!(second_number, first_number + 1);
     }
 
     #[test]
