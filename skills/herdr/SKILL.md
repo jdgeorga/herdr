@@ -87,15 +87,12 @@ herdr agent list
 
 Creation responses expose the IDs to use next. `workspace create` returns `.result.workspace`, `.result.tab`, and `.result.root_pane`. `tab create` returns `.result.tab` and `.result.root_pane`. `pane split` returns the new pane as `.result.pane`.
 
-## UED worker models and reasoning levels
+## Worker models and reasoning levels
 
-User-directed policy (J.G., 2026-09-22; supersedes the 2026-09-19 Luna/Terra/Sol levels):
-Herdr-orchestrated Codex workers use `gpt-6-luna`, `gpt-6-sol` or `gpt-6-astra`; Terra is
-retired. Pass the model explicitly with `-c model=...` on every launch and resume. Choose
-reasoning by task: `low` for fine-grained edits and extraction, `medium` for clear briefs and
-everyday coding, `xhigh` for deep analysis and careful review. Sol always reviews at `xhigh`.
-Verify the live agent setting. Keep the standard service tier unless the user explicitly
-requests otherwise. Roles: `ued/.claude/CLAUDE.md`, "Choosing a model".
+Take the worker model and reasoning level from the project's instructions (ued:
+`ued/.claude/CLAUDE.md`, "Choosing a model"). Pass the model explicitly with `-c model=...` on
+every launch and resume, and verify the live agent setting. Keep the standard service tier
+unless the user explicitly requests otherwise.
 
 ## Start and coordinate an agent
 
